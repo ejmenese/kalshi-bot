@@ -1,0 +1,12 @@
+from atp_data import evaluar_apuesta_data
+
+def estrategia_data(market):
+    if "tennis" not in market["ticker"].lower() and "ATP" not in market["ticker"]:
+        # Para tu mercado actual de Sureshkumar que no dice tennis, lo forzamos
+        if "SURE" not in market["ticker"]:
+            return None
+
+    ok, reason = evaluar_apuesta_data(market["ticker"], market["yes_bid"])
+    if ok:
+        return {"side": "yes", "reason": reason}
+    return None
