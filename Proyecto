@@ -1,0 +1,115 @@
+import os, time, requests
+from datetime import datetime
+from atp_data import evaluar_apuesta_data
+
+# --- CONFIG REAL 5% AGRESIVO ---
+RISK_PER_TRADE = 0.05
+MIN_LIQUIDITY = 1000
+BUDGET_SPLIT = {"momentum": 0.4, "contrarian": 0.3, "data": 0.3}
+MAX_DAILY_LOSS = 5.00 # SEGURO 1: Si pierde $5 en un día, se apaga solo
+TAKE_PROFIT = 88
+STOP_LOSS = 35
+
+API = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_EMAIL = os.getenv("KALSHI_EMAIL")
+KALSHI_PASSWORD = os.getenv("KALSHI_PASSWORD")
+
+daily_loss = 0
+
+def login():
+    r = requests.post(f"{API}/login", json={"email": KALSHI_EMAIL, "password": KALSHI_PASSWORD})
+    r.raise_for_status()
+    return r.json()["token"]
+
+def place_order(headers, ticker, side, price, count):
+    order = {
+        "ticker": ticker,
+        "side": side, # "yes" para comprar
+        "type": "limit",
+        "count": count,
+        "yes_price": price,
+        "no_price": 100 - price
+    }
+    r = requests.post(f"{API}/portfolio/orders", headers=headers, json=order)
+    print(f"ORDEN REAL ENVIADA: {ticker} {side} x{count} @ {price}c -> {r.json()}")
+    return r.json()
+
+def ejecutar():
+    global daily_loss
+    token = login()
+    headers = {"Authorization": f"Bearer {token}"}
+    print(f"[{datetime.now()}] BOT REAL ACTIVADO - OPERANDO CON DINERO REAL")
+
+    while True:
+        try:
+            if daily_loss >= MAX_DAILY_LOSS:
+                print(f"!!! STOP DIARIO ALCANZADO - Perdida ${daily_loss}. Bot pausado 24h")
+                time.sleep(86400) # Pausa 24h
+                daily_loss = 0
+
+            bal = requests.get(f"{API}/portfolio/balance", headers=headers).json()
+            cash = bal["cash"]/100
+            base_bet = cash * RISK_PER_TRADE
+
+            if cash < 2:
+                print("Cash muy bajo, no opera")
+                time.sleep(300)
+                continue
+
+            markets = requests.get(f"{API}/markets?status=open&limit=100", headers=headers).json()["markets"]
+
+            for m in markets:
+                if m["volume"] < MIN_LIQUIDITY: continue
+                if not (20 <= m["yes_ask"] <= 80): continue
+
+                for nombre, func in [
+                    ("momentum", lambda x: {"side":"yes","reason":"Momentum"} if x.get("price_change_1h",0)>=10 else None),
+                    ("contrarian", lambda x: {"side":"yes","reason":"Contrarian"} if x["yes_bid"]<=30 else None),
+                    ("data", lambda x: {"side":"yes","reason":evaluar_apuesta_data(x["ticker"], x["yes_bid"])[1]} if evaluar_apuesta_data(x["ticker"], x["yes_bid"])[0] else None)
+                ]:
+                    # Eval real
+                    from atp_data import evaluar_apuesta_data as eval_data
+                    señal = None
+                    if nombre == "data":
+                        ok, rs = eval_data(m["ticker"], m["yes_bid"])
+                        if ok: señal = {"side":"yes","reason":rs}
+                    elif nombre == "momentum" and m.get("price_change_1h",0) >= 10:
+                        señal = {"side":"yes","reason":f"Momentum +{m.get('price_change_1h')}c"}
+                    elif nombre == "contrarian" and m["yes_bid"] <= 30:
+                        señal = {"side":"yes","reason":f"Contrarian {m['yes_bid']}c"}
+
+                    if señal:
+                        monto_dolares = base_bet * BUDGET_SPLIT[nombre]
+                        count = max(1, int((monto_dolares * 100) / m["yes_ask"]))
+
+                        # SEGURO 2: No comprar más de lo que tienes
+                        if monto_dolares > cash * 0.06:
+                            continue
+
+                        print(f"COMPRANDO REAL [{nombre}] {m['ticker']} {señal['reason']} ${monto_dolares:.2f} x{count}")
+                        place_order(headers, m["ticker"], "yes", m["yes_ask"], count)
+
+            # SEGURO 3: Venta automática de tu posición atrapada
+            positions = requests.get(f"{API}/portfolio/positions", headers=headers).json().get("positions", [])
+            for pos in positions:
+                mp = pos.get("market_price", 0)
+                if mp >= TAKE_PROFIT:
+                    print(f"TAKE PROFIT {pos['ticker']} @ {mp}c - VENDIENDO")
+                    place_order(headers, pos["ticker"], "no", 100-mp, pos["count"])
+                if mp <= STOP_LOSS and mp > 0:
+                    print(f"STOP LOSS {pos['ticker']} @ {mp}c - VENDIENDO")
+                    place_order(headers, pos["ticker"], "no", 100-mp, pos["count"])
+                    daily_loss += (pos["count"] * (pos["avg_price"] - mp) / 100)
+
+            time.sleep(60)
+
+        except Exception as e:
+            print(f"Error {e}")
+            time.sleep(60)
+            try:
+                token = login()
+                headers = {"Authorization": f"Bearer {token}"}
+            except: pass
+
+if __name__ == "__main__":
+    ejecutar()
