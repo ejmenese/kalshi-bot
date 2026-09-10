@@ -1,0 +1,23 @@
+import requests
+
+def get_player_stats(player_name):
+    mock_db = {
+        "sureshkumar": {"rank": 342, "last_5": ["W","W","L","W","W"], "win_rate": 0.68},
+        "koyama": {"rank": 489, "last_5": ["L","L","W","L","L"], "win_rate": 0.32},
+    }
+    key = player_name.lower()
+    for k in mock_db:
+        if k in key:
+            d = mock_db[k]
+            return {"name":player_name,"rank":d["rank"],"last_5":d["last_5"],"form_score":d["last_5"].count("W"),"win_rate":d["win_rate"],"found":True}
+    return {"found":False}
+
+def evaluar_apuesta_data(ticker, market_price):
+    # Caso Sureshkumar vs Koyama
+    if "SURE" in ticker.upper() or "KOY" in ticker.upper() or "TENNIS" in ticker.upper() or "ATP" in ticker.upper():
+        fav = get_player_stats("Sureshkumar")
+        und = get_player_stats("Koyama")
+        if fav.get("found") and und.get("found"):
+            if fav["rank"] < und["rank"] and fav["form_score"] >= 3 and 60 <= market_price <= 75:
+                return True, f"DATA OK Fav Rk{fav['rank']} {fav['form_score']}/5 vs Rk{und['rank']}"
+    return False, "No pasa filtro data"
