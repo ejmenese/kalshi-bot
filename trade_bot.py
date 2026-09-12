@@ -157,7 +157,7 @@ def look_for_entries(cur, public_client: KalshiClient, trading_client: KalshiTra
 
         volume_raw = market.get("volume_fp") or 0
         try:
-            volume = int(volume_raw)
+            volume = int(float(volume_raw))
         except (TypeError, ValueError):
             volume = 0
         yes_bid = market.get("yes_bid_dollars")

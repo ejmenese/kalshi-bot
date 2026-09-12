@@ -92,7 +92,7 @@ def normalize_snapshot(market: dict[str, Any]) -> dict[str, Any]:
     este mapeo contra la respuesta real en vez de adivinar."""
     volume_raw = market.get("volume_fp")
     try:
-        volume = int(volume_raw) if volume_raw is not None else None
+        volume = int(float(volume_raw)) if volume_raw is not None else None
     except (TypeError, ValueError):
         volume = None
     return {
