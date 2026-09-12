@@ -155,7 +155,11 @@ def look_for_entries(cur, public_client: KalshiClient, trading_client: KalshiTra
         if not ticker or already_holds(cur, ticker):
             continue
 
-        volume = market.get("volume_fp") or 0
+        volume_raw = market.get("volume_fp") or 0
+        try:
+            volume = int(volume_raw)
+        except (TypeError, ValueError):
+            volume = 0
         yes_bid = market.get("yes_bid_dollars")
         yes_ask = market.get("yes_ask_dollars")
         if yes_bid is None or yes_ask is None:

@@ -34,7 +34,8 @@ class KalshiClient:
 
     def get_open_markets_for_series(self, series_ticker: str, limit: int = 100) -> list[dict[str, Any]]:
         """Trae todos los mercados actualmente abiertos de una serie (p. ej.
-        KXMLBGAME). Pagina con cursor hasta agotar resultados."""
+        KXMLBGAME). Pagina con cursor hasta agotar resultados. Reintenta con
+        backoff si Kalshi responde 429 (rate limit)."""
         results: list[dict[str, Any]] = []
         cursor = None
         url = f"{base_url()}/markets"
@@ -42,14 +43,26 @@ class KalshiClient:
             params = {"series_ticker": series_ticker, "status": "open", "limit": limit}
             if cursor:
                 params["cursor"] = cursor
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout_seconds)
-                resp.raise_for_status()
-            except requests.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else "?"
-                print(f"[warn] no se pudo leer la serie '{series_ticker}' (HTTP {status}): {exc}")
+
+            data = None
+            for attempt in range(4):
+                try:
+                    resp = self.session.get(url, params=params, timeout=self.timeout_seconds)
+                    if resp.status_code == 429:
+                        wait = 2 ** attempt
+                        print(f"[warn] rate limit en '{series_ticker}', reintentando en {wait}s")
+                        time.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else "?"
+                    print(f"[warn] no se pudo leer la serie '{series_ticker}' (HTTP {status}): {exc}")
+                    break
+            if data is None:
                 break
-            data = resp.json()
+
             results.extend(data.get("markets", []))
             cursor = data.get("cursor")
             if not cursor:
@@ -77,6 +90,11 @@ def normalize_snapshot(market: dict[str, Any]) -> dict[str, Any]:
     volumen como volume_fp -- no *_cents/volume 'planos'. Si Render reporta
     errores de columna al insertar, imprime `market` crudo una vez y ajusta
     este mapeo contra la respuesta real en vez de adivinar."""
+    volume_raw = market.get("volume_fp")
+    try:
+        volume = int(volume_raw) if volume_raw is not None else None
+    except (TypeError, ValueError):
+        volume = None
     return {
         "ticker": market.get("ticker"),
         "series_ticker": market.get("event_ticker", "").rsplit("-", 1)[0] if market.get("event_ticker") else None,
@@ -85,7 +103,7 @@ def normalize_snapshot(market: dict[str, Any]) -> dict[str, Any]:
         "yes_ask": _as_float(market.get("yes_ask_dollars")),
         "no_bid": _as_float(market.get("no_bid_dollars")),
         "no_ask": _as_float(market.get("no_ask_dollars")),
-        "volume": market.get("volume_fp"),
+        "volume": volume,
         "status": market.get("status"),
         "close_time": market.get("close_time"),
     }
