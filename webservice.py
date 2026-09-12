@@ -37,6 +37,43 @@ def balance():
         return jsonify(error=str(exc)), 500
 
 
+@app.get("/trades")
+def trades():
+    """Historial de operaciones del trade_bot (abiertas y cerradas)."""
+    status_filter = request.args.get("status")  # open | closed_tp | closed_sl | closed_settled
+    limit = min(int(request.args.get("limit", 100)), 1000)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if status_filter:
+                cur.execute(
+                    """SELECT * FROM kalshi_trades WHERE status = %s
+                       ORDER BY opened_at DESC LIMIT %s""",
+                    (status_filter, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM kalshi_trades ORDER BY opened_at DESC LIMIT %s",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+
+            cur.execute(
+                """SELECT
+                       COUNT(*) FILTER (WHERE status = 'open') AS open_count,
+                       COUNT(*) FILTER (WHERE status != 'open') AS closed_count,
+                       COALESCE(SUM(pnl_cents) FILTER (WHERE status != 'open'), 0) AS total_pnl_cents,
+                       COALESCE(SUM(pnl_cents) FILTER (
+                           WHERE status != 'open' AND closed_at::date = now()::date
+                       ), 0) AS today_pnl_cents
+                   FROM kalshi_trades"""
+            )
+            summary = cur.fetchone()
+        return jsonify(summary=summary, trades=rows)
+    finally:
+        conn.close()
+
+
 @app.get("/health")
 def health():
     try:
