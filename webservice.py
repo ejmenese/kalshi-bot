@@ -24,6 +24,19 @@ def get_conn():
     return psycopg2.connect(database_url)
 
 
+@app.get("/balance")
+def balance():
+    """Endpoint temporal para verificar que las credenciales de trading
+    funcionan. Solo lectura -- no coloca ordenes."""
+    from kalshi_trading_client import KalshiTradingClient
+
+    try:
+        client = KalshiTradingClient()
+        return jsonify(client.get_balance())
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
 @app.get("/health")
 def health():
     try:
