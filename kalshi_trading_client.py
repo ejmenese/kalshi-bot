@@ -27,17 +27,28 @@ PROD_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
 
 class KalshiTradingClient:
     def __init__(self):
-        api_key_id = os.environ.get("KALSHI_API_KEY_ID")
-        private_key_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM")
+        env = os.environ.get("KALSHI_ENV", "demo").strip().lower()
+        self.base_url = PROD_BASE_URL if env == "prod" else DEMO_BASE_URL
+
+        # Credenciales separadas por ambiente -- asi cambiar KALSHI_ENV a
+        # "prod" no deja de funcionar por accidente con llaves de demo
+        # mezcladas, y viceversa.
+        if env == "prod":
+            api_key_id = os.environ.get("KALSHI_PROD_API_KEY_ID")
+            private_key_pem = os.environ.get("KALSHI_PROD_PRIVATE_KEY_PEM")
+            missing = "KALSHI_PROD_API_KEY_ID y/o KALSHI_PROD_PRIVATE_KEY_PEM"
+        else:
+            api_key_id = os.environ.get("KALSHI_API_KEY_ID")
+            private_key_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM")
+            missing = "KALSHI_API_KEY_ID y/o KALSHI_PRIVATE_KEY_PEM"
+
         if not api_key_id or not private_key_pem:
-            raise RuntimeError("faltan KALSHI_API_KEY_ID y/o KALSHI_PRIVATE_KEY_PEM en el entorno")
+            raise RuntimeError(f"faltan {missing} en el entorno (ambiente actual: {env})")
 
         self.api_key_id = api_key_id
         self.private_key = serialization.load_pem_private_key(
             private_key_pem.encode(), password=None
         )
-        env = os.environ.get("KALSHI_ENV", "demo").strip().lower()
-        self.base_url = PROD_BASE_URL if env == "prod" else DEMO_BASE_URL
         self.session = requests.Session()
 
     def _headers(self, method: str, path: str) -> dict[str, str]:
