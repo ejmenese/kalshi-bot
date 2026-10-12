@@ -67,9 +67,13 @@ EXCLUDED_SERIES_WORDS = ("EXACT", "SCORE", "SPREAD", "TOTAL", "PROP")
 EXCLUDED_MARKET_SUFFIXES = ("-TIE", "-DRAW")
 
 
+_ew = os.environ.get("STRAT_EXCLUDE_WORDS", "")
+USER_EXCLUDED_WORDS = tuple(w.strip().upper() for w in _ew.split(",") if w.strip())
+
+
 def series_allowed(series: str) -> bool:
     s = series.upper()
-    return not any(w in s for w in EXCLUDED_SERIES_WORDS)
+    return not any(w in s for w in EXCLUDED_SERIES_WORDS) and not any(w in s for w in USER_EXCLUDED_WORDS)
 
 
 def market_allowed(ticker: str) -> bool:
@@ -509,7 +513,11 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
 
 
 def main() -> None:
-    series_tickers = [s for s in resolve_series(os.environ.get("KALSHI_SERIES", "ALL_SPORTS")) if series_allowed(s)]
+    all_series = resolve_series(os.environ.get("KALSHI_SERIES", "ALL_SPORTS"))
+    series_tickers = [s for s in all_series if series_allowed(s)]
+    skipped = [s for s in all_series if not series_allowed(s)]
+    if USER_EXCLUDED_WORDS:
+        print(f"[info] {len(skipped)} series excluidas por palabra; quedan {len(series_tickers)}")
 
     public_client = KalshiClient()
     trading_client = KalshiTradingClient()

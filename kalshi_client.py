@@ -111,6 +111,10 @@ GAME_SUFFIXES = ("GAME", "MATCH", "FIGHT", "BOUT")
 
 ALL_SPORTS_KEYWORD = "ALL_SPORTS"
 
+# Deportes que no se operan: STRAT_EXCLUDE_TAGS="Soccer,Basketball" (etiquetas
+# de Kalshi). Ademas trade_bot.py aplica STRAT_EXCLUDE_WORDS sobre el ticker.
+EXCLUDE_TAGS = {t.strip().lower() for t in os.environ.get("STRAT_EXCLUDE_TAGS", "").split(",") if t.strip()}
+
 
 def discover_sports_game_series(timeout_seconds: float = 15.0) -> list[str]:
     """Pide a Kalshi todas las series de la categoria Sports y se queda con
@@ -142,8 +146,12 @@ def discover_sports_game_series(timeout_seconds: float = 15.0) -> list[str]:
             break
         for serie in data.get("series") or []:
             ticker = (serie.get("ticker") or "").upper()
-            if ticker.endswith(GAME_SUFFIXES):
-                found.add(ticker)
+            if not ticker.endswith(GAME_SUFFIXES):
+                continue
+            tags = {str(t).strip().lower() for t in (serie.get("tags") or [])}
+            if tags & EXCLUDE_TAGS:
+                continue
+            found.add(ticker)
         cursor = data.get("cursor")
         if not cursor:
             break
