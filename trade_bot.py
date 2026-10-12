@@ -50,6 +50,9 @@ ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in (
 # que cruce el libro y se llene aunque el precio siga cayendo.
 SL_SLIPPAGE_CENTS = int(os.environ.get("STRAT_SL_SLIPPAGE_CENTS", "3"))
 # Pausa entre series para no saturar la API de Kalshi (errores 429).
+# Ambiente en el que opera esta corrida; cada trade se etiqueta con el y todas
+# las consultas filtran por el, para no mezclar demo con dinero real.
+BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
 SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"))
 # Candado de Postgres para que nunca corran dos instancias a la vez.
 RUN_LOCK_ID = 774411
@@ -90,9 +93,9 @@ def reopen_wrongly_settled(conn, cur, trading_client: KalshiTradingClient) -> No
     cur.execute(
         """UPDATE kalshi_trades SET status = 'open', closed_at = NULL
            WHERE status = 'closed_settled' AND exit_price IS NULL AND pnl_cents IS NULL
-             AND ticker = ANY(%s)
-             AND id IN (SELECT MAX(id) FROM kalshi_trades GROUP BY ticker)""",
-        (held,),
+             AND ticker = ANY(%s) AND env = %s
+             AND id IN (SELECT MAX(id) FROM kalshi_trades WHERE env = %s GROUP BY ticker)""",
+        (held, BOT_ENV, BOT_ENV),
     )
     if cur.rowcount:
         print(f"[info] {cur.rowcount} posiciones reabiertas: seguian activas en Kalshi")
@@ -184,6 +187,7 @@ CREATE TABLE IF NOT EXISTS kalshi_trades (
     opened_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     closed_at     TIMESTAMPTZ
 );
+ALTER TABLE kalshi_trades ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'demo';
 """
 
 
@@ -199,10 +203,10 @@ def recent_realized_pnl_cents(cur) -> int:
     cur.execute(
         """
         SELECT COALESCE(SUM(pnl_cents), 0) FROM kalshi_trades
-        WHERE status != 'open'
+        WHERE status != 'open' AND env = %s
           AND closed_at >= now() - (%s * interval '1 hour')
         """,
-        (LOSS_WINDOW_HOURS,),
+        (BOT_ENV, LOSS_WINDOW_HOURS),
     )
     return cur.fetchone()[0]
 
@@ -219,22 +223,22 @@ def game_recently_traded(cur, ticker: str) -> bool:
     cur.execute(
         """
         SELECT 1 FROM kalshi_trades
-        WHERE ticker LIKE %s
+        WHERE ticker LIKE %s AND env = %s
           AND (status = 'open' OR opened_at >= now() - (%s * interval '1 hour'))
         LIMIT 1
         """,
-        (event_of(ticker) + "-%", GAME_COOLDOWN_HOURS),
+        (event_of(ticker) + "-%", BOT_ENV, GAME_COOLDOWN_HOURS),
     )
     return cur.fetchone() is not None
 
 
 def open_positions_count(cur) -> int:
-    cur.execute("SELECT COUNT(*) FROM kalshi_trades WHERE status = 'open'")
+    cur.execute("SELECT COUNT(*) FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     return cur.fetchone()[0]
 
 
 def already_holds(cur, ticker: str) -> bool:
-    cur.execute("SELECT 1 FROM kalshi_trades WHERE ticker = %s AND status = 'open'", (ticker,))
+    cur.execute("SELECT 1 FROM kalshi_trades WHERE ticker = %s AND status = 'open' AND env = %s", (ticker, BOT_ENV))
     return cur.fetchone() is not None
 
 
@@ -260,10 +264,10 @@ def backfill_settled_pnl(cur, public_client: KalshiClient, max_rows: int = 20) -
     justo las perdidas que el tope de perdida no estaba contando."""
     cur.execute(
         """SELECT id, ticker, count, entry_price FROM kalshi_trades
-           WHERE status = 'closed_settled' AND pnl_cents IS NULL
+           WHERE status = 'closed_settled' AND pnl_cents IS NULL AND env = %s
              AND closed_at >= now() - (%s * interval '1 hour')
            ORDER BY closed_at DESC LIMIT %s""",
-        (LOSS_WINDOW_HOURS, max_rows),
+        (BOT_ENV, LOSS_WINDOW_HOURS, max_rows),
     )
     for trade_id, ticker, count, entry_price in cur.fetchall():
         pnl = settlement_pnl_cents(public_client, ticker, entry_price, count)
@@ -275,7 +279,7 @@ def backfill_settled_pnl(cur, public_client: KalshiClient, max_rows: int = 20) -
 
 
 def manage_open_positions(cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
-    cur.execute("SELECT id, ticker, count, entry_price FROM kalshi_trades WHERE status = 'open'")
+    cur.execute("SELECT id, ticker, count, entry_price FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     open_trades = cur.fetchall()
     if not open_trades:
         return
@@ -413,7 +417,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         return
 
     def total_open() -> int:
-        cur.execute("SELECT ticker FROM kalshi_trades WHERE status = 'open'")
+        cur.execute("SELECT ticker FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
         return len(busy | {r[0] for r in cur.fetchall()})
 
     if total_open() >= MAX_OPEN_POSITIONS:
@@ -489,9 +493,9 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         filled = min(filled, FIXED_CONTRACTS)
         entry = avg_cents if avg_cents is not None else yes_ask_cents
         cur.execute(
-            """INSERT INTO kalshi_trades (ticker, side, count, entry_price, status)
-               VALUES (%s, 'yes', %s, %s, 'open')""",
-            (ticker, filled, entry),
+            """INSERT INTO kalshi_trades (ticker, side, count, entry_price, status, env)
+               VALUES (%s, 'yes', %s, %s, 'open', %s)""",
+            (ticker, filled, entry, BOT_ENV),
         )
         conn.commit()  # se guarda en el acto: si la corrida falla despues, no se pierde
         busy.add(ticker)
