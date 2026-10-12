@@ -52,6 +52,11 @@ SL_SLIPPAGE_CENTS = int(os.environ.get("STRAT_SL_SLIPPAGE_CENTS", "3"))
 # Pausa entre series para no saturar la API de Kalshi (errores 429).
 # Ambiente en el que opera esta corrida; cada trade se etiqueta con el y todas
 # las consultas filtran por el, para no mezclar demo con dinero real.
+# Cierre manual: STRAT_FORCE_CLOSE=ALL o una lista de tickers separados por coma.
+# Vende esas posiciones al mejor bid (con el mismo margen del stop-loss).
+_fc = os.environ.get("STRAT_FORCE_CLOSE", "").strip()
+FORCE_CLOSE_ALL = _fc.upper() == "ALL"
+FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOSE_ALL else set()
 BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
 SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"))
 # Candado de Postgres para que nunca corran dos instancias a la vez.
@@ -350,7 +355,8 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
         hit_take_profit = current_bid_cents >= entry_price + TAKE_PROFIT_CENTS
         hit_stop_loss = current_bid_cents <= entry_price - STOP_LOSS_CENTS
 
-        if not (hit_take_profit or hit_stop_loss):
+        forced = FORCE_CLOSE_ALL or ticker in FORCE_CLOSE
+        if not (hit_take_profit or hit_stop_loss or forced):
             continue
 
         # Vende solo los contratos que de verdad tienes en Kalshi. Si la compra
@@ -373,7 +379,7 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
                 count = real
 
         # Take-profit al bid; stop-loss unos centavos abajo para que se llene.
-        sell_price = current_bid_cents if hit_take_profit else max(1, current_bid_cents - SL_SLIPPAGE_CENTS)
+        sell_price = current_bid_cents if (hit_take_profit and not forced) else max(1, current_bid_cents - SL_SLIPPAGE_CENTS)
         try:
             resp = trading_client.create_order(
                 ticker=ticker, side="yes", action="sell", count=count, price_cents=sell_price,
@@ -400,7 +406,7 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
             print(f"[info] {ticker}: venta parcial {filled} de {count}; el resto sigue abierto (pnl parcial {pnl_part}c)")
             continue
 
-        status = "closed_tp" if hit_take_profit else "closed_sl"
+        status = "closed_manual" if forced else ("closed_tp" if hit_take_profit else "closed_sl")
         cur.execute(
             """UPDATE kalshi_trades
                SET status = %s, exit_price = %s, pnl_cents = COALESCE(pnl_cents, 0) + %s, closed_at = %s
