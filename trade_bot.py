@@ -465,6 +465,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                 print(f"[warn] no se pudo leer la serie {series}: {exc}")
             time.sleep(SERIES_PAUSE_SECONDS)
 
+    insufficient_fails = 0
     for market in iter_markets():
         if total_open() >= MAX_OPEN_POSITIONS:
             print("[info] maximo de posiciones abiertas alcanzado")
@@ -517,7 +518,11 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                 print(f"[info] saldo insuficiente en Kalshi al comprar {ticker} ({FIXED_CONTRACTS} x {yes_ask_cents}c); no se buscan mas compras en esta corrida")
                 print(f"[info] detalle del error: {str(exc)[:300]}")
                 print(f"[info] balance segun la API: {bal}")
-                break
+                insufficient_fails += 1
+                if insufficient_fails >= 3:
+                    print("[info] 3 rechazos por saldo seguidos; no se buscan mas compras en esta corrida")
+                    break
+                continue
             print(f"[warn] no se pudo comprar {ticker}: {exc}")
             continue
 
