@@ -45,6 +45,10 @@ LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
 GAME_COOLDOWN_HOURS = int(os.environ.get("STRAT_GAME_COOLDOWN_HOURS", "24"))
 # Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
 MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
+# Kalshi reparte el saldo en "bolsillos" (exchange_index) y cada mercado solo
+# puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
+# compra en mercados cuyo bolsillo tiene saldo suficiente.
+POCKET_CHECK = os.environ.get("STRAT_POCKET_CHECK", "1").strip().lower() in ("1", "true", "yes", "si")
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -465,6 +469,15 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                 print(f"[warn] no se pudo leer la serie {series}: {exc}")
             time.sleep(SERIES_PAUSE_SECONDS)
 
+    pockets: dict[int, float] | None = None
+    if POCKET_CHECK:
+        try:
+            bd = trading_client.get_balance().get("balance_breakdown") or []
+            pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
+            print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
+        except Exception as bexc:
+            print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
+    skipped_pockets: set[int] = set()
     insufficient_fails = 0
     for market in iter_markets():
         if total_open() >= MAX_OPEN_POSITIONS:
@@ -504,6 +517,15 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         if not (MIN_ENTRY_CENTS <= yes_ask_cents <= MAX_ENTRY_CENTS):
             continue
 
+        pocket = market.get("exchange_index")
+        if pockets is not None and pocket is not None:
+            cost = FIXED_CONTRACTS * yes_ask_cents / 100.0
+            if pockets.get(int(pocket), 0.0) < cost + 0.05:
+                if int(pocket) not in skipped_pockets:
+                    skipped_pockets.add(int(pocket))
+                    print(f"[info] bolsillo {pocket} sin saldo suficiente (${pockets.get(int(pocket), 0.0):.2f}); se omiten sus mercados")
+                continue
+
         try:
             resp = trading_client.create_order(
                 ticker=ticker, side="yes", action="buy", count=FIXED_CONTRACTS, price_cents=yes_ask_cents,
@@ -541,6 +563,8 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             print(f"[info] {ticker}: no habia vendedores a {yes_ask_cents}c; no se compro nada")
             continue
         filled = min(filled, FIXED_CONTRACTS)
+        if pockets is not None and pocket is not None:
+            pockets[int(pocket)] = pockets.get(int(pocket), 0.0) - filled * (avg_cents if avg_cents is not None else yes_ask_cents) / 100.0
         entry = avg_cents if avg_cents is not None else yes_ask_cents
         cur.execute(
             """INSERT INTO kalshi_trades (ticker, side, count, entry_price, status, env)
