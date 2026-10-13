@@ -43,6 +43,8 @@ LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
 # Despues de operar un partido (abierto o cerrado), no se vuelve a entrar en
 # ningun mercado de ese mismo partido durante estas horas.
 GAME_COOLDOWN_HOURS = int(os.environ.get("STRAT_GAME_COOLDOWN_HOURS", "24"))
+# Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
+MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -241,6 +243,18 @@ def game_recently_traded(cur, ticker: str) -> bool:
     return cur.fetchone() is not None
 
 
+def entries_last_hour(cur) -> int:
+    cur.execute(
+        "SELECT COUNT(*) FROM kalshi_trades WHERE env = %s AND opened_at >= now() - interval '1 hour'",
+        (BOT_ENV,),
+    )
+    return cur.fetchone()[0]
+
+
+def hourly_cap_reached(cur) -> bool:
+    return MAX_ENTRIES_PER_HOUR > 0 and entries_last_hour(cur) >= MAX_ENTRIES_PER_HOUR
+
+
 def open_positions_count(cur) -> int:
     cur.execute("SELECT COUNT(*) FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     return cur.fetchone()[0]
@@ -433,6 +447,9 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     if total_open() >= MAX_OPEN_POSITIONS:
         print("[info] maximo de posiciones abiertas alcanzado, no se buscan nuevas entradas")
         return
+    if hourly_cap_reached(cur):
+        print(f"[info] ya hubo {MAX_ENTRIES_PER_HOUR} entrada(s) en la ultima hora; no se abren mas hasta que pase")
+        return
     if recent_realized_pnl_cents(cur) <= -DAILY_LOSS_LIMIT_CENTS:
         print(f"[info] limite de perdida alcanzado en las ultimas {LOSS_WINDOW_HOURS} h, no se abren nuevas posiciones")
         return
@@ -451,6 +468,9 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     for market in iter_markets():
         if total_open() >= MAX_OPEN_POSITIONS:
             print("[info] maximo de posiciones abiertas alcanzado")
+            break
+        if hourly_cap_reached(cur):
+            print(f"[info] limite de {MAX_ENTRIES_PER_HOUR} entrada(s) por hora alcanzado")
             break
 
         ticker = market.get("ticker")
