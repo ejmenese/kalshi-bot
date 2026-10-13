@@ -510,7 +510,13 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             )
         except Exception as exc:
             if "insufficient_balance" in str(exc):
-                print("[info] saldo insuficiente en Kalshi; no se buscan mas compras en esta corrida")
+                try:
+                    bal = trading_client.get_balance()
+                except Exception as bexc:
+                    bal = f"no se pudo leer ({bexc})"
+                print(f"[info] saldo insuficiente en Kalshi al comprar {ticker} ({FIXED_CONTRACTS} x {yes_ask_cents}c); no se buscan mas compras en esta corrida")
+                print(f"[info] detalle del error: {str(exc)[:300]}")
+                print(f"[info] balance segun la API: {bal}")
                 break
             print(f"[warn] no se pudo comprar {ticker}: {exc}")
             continue
