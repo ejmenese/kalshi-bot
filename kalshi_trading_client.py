@@ -79,6 +79,9 @@ class KalshiTradingClient:
     def get_balance(self) -> dict[str, Any]:
         return self._get("/portfolio/balance")
 
+    def get_resting_orders(self) -> dict[str, Any]:
+        return self._get("/portfolio/orders", {"status": "resting", "limit": 50})
+
     def get_positions(self) -> dict[str, Any]:
         return self._get("/portfolio/positions")
 

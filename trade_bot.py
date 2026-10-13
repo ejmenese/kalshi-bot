@@ -518,6 +518,15 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                 print(f"[info] saldo insuficiente en Kalshi al comprar {ticker} ({FIXED_CONTRACTS} x {yes_ask_cents}c); no se buscan mas compras en esta corrida")
                 print(f"[info] detalle del error: {str(exc)[:300]}")
                 print(f"[info] balance segun la API: {bal}")
+                if insufficient_fails == 0:
+                    try:
+                        ro = trading_client.get_resting_orders()
+                        orders = ro.get("orders", [])
+                        print(f"[info] ordenes pendientes en Kalshi: {len(orders)}")
+                        for o in orders[:10]:
+                            print(f"[info]   pendiente: {str(o)[:300]}")
+                    except Exception as oexc:
+                        print(f"[info] no se pudieron leer ordenes pendientes: {str(oexc)[:200]}")
                 insufficient_fails += 1
                 if insufficient_fails >= 3:
                     print("[info] 3 rechazos por saldo seguidos; no se buscan mas compras en esta corrida")
