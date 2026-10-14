@@ -456,7 +456,16 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
     su costo promedio. No toma ganancias."""
     if not PROTECT_MANUAL:
         return
-    cur.execute("SELECT DISTINCT ticker FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
+    # Se excluyen las posiciones abiertas del bot y tambien las que el bot
+    # abrio o cerro hace poco: Kalshi tarda un rato en reflejar una venta y
+    # sin esto se confundiria una posicion recien cerrada con una manual.
+    cur.execute(
+        """SELECT DISTINCT ticker FROM kalshi_trades
+           WHERE env = %s AND (status = 'open'
+                 OR opened_at >= now() - interval '30 minutes'
+                 OR closed_at >= now() - interval '30 minutes')""",
+        (BOT_ENV,),
+    )
     bot_open = {r[0] for r in cur.fetchall()}
     try:
         data = trading_client._get("/portfolio/positions", {"limit": 1000})
@@ -473,6 +482,8 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
             qty = 0.0
         if qty == 0:
             continue
+        if 0 < qty < 1:
+            continue  # restos fraccionarios que no se pueden vender
         if qty < 0:
             print(f"[info] posicion manual {ticker}: es del lado NO ({qty}); no se vigila")
             continue
