@@ -71,7 +71,8 @@ FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOS
 # Con STRAT_CANCEL_ALL_ORDERS=1, al inicio de la corrida se cancelan TODAS las
 # ordenes que sigan "resting" (sin llenar) en el libro de Kalshi -- tanto las
 # que puso el bot como las que el usuario puso a mano en la app. Es un
-# interruptor manual: se apaga solo despues de usarse (ver cancel_all_resting_orders).
+# interruptor manual: queda activo en cada corrida hasta que se quite o se
+# ponga en 0 la variable en Render (no se apaga solo).
 CANCEL_ALL_ORDERS = os.environ.get("STRAT_CANCEL_ALL_ORDERS", "").strip().lower() in ("1", "true", "yes", "si")
 BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
 SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"))
