@@ -85,6 +85,21 @@ class KalshiTradingClient:
     def get_positions(self) -> dict[str, Any]:
         return self._get("/portfolio/positions")
 
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        """Cancela una orden que sigue 'resting' (sin llenar) en el libro.
+        DELETE /portfolio/orders/{order_id} segun el Trade API v2 de Kalshi."""
+        path = f"/portfolio/orders/{order_id}"
+        resp = self.session.delete(
+            self.base_url + path,
+            headers=self._headers("DELETE", "/trade-api/v2" + path),
+            timeout=10,
+        )
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason}: {resp.text[:300]}", response=resp
+            )
+        return resp.json() if resp.text else {}
+
     def create_order(
         self,
         ticker: str,

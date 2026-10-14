@@ -68,6 +68,11 @@ SL_SLIPPAGE_CENTS = int(os.environ.get("STRAT_SL_SLIPPAGE_CENTS", "3"))
 _fc = os.environ.get("STRAT_FORCE_CLOSE", "").strip()
 FORCE_CLOSE_ALL = _fc.upper() == "ALL"
 FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOSE_ALL else set()
+# Con STRAT_CANCEL_ALL_ORDERS=1, al inicio de la corrida se cancelan TODAS las
+# ordenes que sigan "resting" (sin llenar) en el libro de Kalshi -- tanto las
+# que puso el bot como las que el usuario puso a mano en la app. Es un
+# interruptor manual: se apaga solo despues de usarse (ver cancel_all_resting_orders).
+CANCEL_ALL_ORDERS = os.environ.get("STRAT_CANCEL_ALL_ORDERS", "").strip().lower() in ("1", "true", "yes", "si")
 BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
 SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"))
 # Candado de Postgres para que nunca corran dos instancias a la vez.
@@ -89,6 +94,32 @@ def series_allowed(series: str) -> bool:
 
 def market_allowed(ticker: str) -> bool:
     return not ticker.upper().endswith(EXCLUDED_MARKET_SUFFIXES)
+
+
+def cancel_all_resting_orders(trading_client: KalshiTradingClient) -> None:
+    """Cancela toda orden que siga 'resting' (sin llenar) en el libro de
+    Kalshi. Se dispara con STRAT_CANCEL_ALL_ORDERS=1; no toca posiciones ya
+    llenas (eso es STRAT_FORCE_CLOSE)."""
+    try:
+        orders = (trading_client.get_resting_orders() or {}).get("orders", [])
+    except Exception as exc:
+        print(f"[warn] no se pudo leer ordenes pendientes para cancelar: {exc}")
+        return
+    if not orders:
+        print("[info] STRAT_CANCEL_ALL_ORDERS activo: no hay ordenes pendientes en Kalshi")
+        return
+    print(f"[info] STRAT_CANCEL_ALL_ORDERS activo: cancelando {len(orders)} orden(es) pendiente(s)")
+    for order in orders:
+        order_id = order.get("order_id") or order.get("id")
+        ticker = order.get("ticker", "?")
+        if not order_id:
+            print(f"[warn] orden de {ticker} sin order_id en la respuesta; se omite")
+            continue
+        try:
+            trading_client.cancel_order(order_id)
+            print(f"[info] cancelada: {ticker} ({order_id})")
+        except Exception as exc:
+            print(f"[warn] no se pudo cancelar {ticker} ({order_id}): {exc}")
 
 
 def reopen_wrongly_settled(conn, cur, trading_client: KalshiTradingClient) -> None:
@@ -686,6 +717,9 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
             conn.commit()
+
+        if CANCEL_ALL_ORDERS:
+            cancel_all_resting_orders(trading_client)
 
         with conn.cursor() as cur:
             reopen_wrongly_settled(conn, cur, trading_client)
