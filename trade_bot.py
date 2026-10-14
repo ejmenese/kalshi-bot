@@ -49,6 +49,11 @@ MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
 # puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
 # compra en mercados cuyo bolsillo tiene saldo suficiente.
 POCKET_CHECK = os.environ.get("STRAT_POCKET_CHECK", "1").strip().lower() in ("1", "true", "yes", "si")
+# Vigila las posiciones que pones a mano en Kalshi (las que no abrio el bot) y
+# las cierra si caen MANUAL_STOP_CENTS por debajo de su costo promedio.
+# Nunca las cierra por ganancia.
+PROTECT_MANUAL = os.environ.get("STRAT_PROTECT_MANUAL", "1").strip().lower() in ("1", "true", "yes", "si")
+MANUAL_STOP_CENTS = int(os.environ.get("STRAT_MANUAL_STOP_CENTS", str(STOP_LOSS_CENTS)))
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -438,6 +443,76 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
         print(f"[info] {ticker} cerrado ({status}) a {exit_price}c, pnl {pnl_part}c")
 
 
+def _dollars_to_cents(value) -> float | None:
+    try:
+        return float(value) * 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+def protect_manual_positions(cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
+    """Vigila las posiciones YES de tu cuenta que el bot no abrio (las que
+    pones a mano) y las vende si el precio cae MANUAL_STOP_CENTS por debajo de
+    su costo promedio. No toma ganancias."""
+    if not PROTECT_MANUAL:
+        return
+    cur.execute("SELECT DISTINCT ticker FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
+    bot_open = {r[0] for r in cur.fetchall()}
+    try:
+        data = trading_client._get("/portfolio/positions", {"limit": 1000})
+    except Exception as exc:
+        print(f"[warn] no se pudieron leer posiciones para vigilar las manuales: {exc}")
+        return
+    for p in data.get("market_positions") or []:
+        ticker = p.get("ticker")
+        if not ticker or ticker in bot_open:
+            continue
+        try:
+            qty = float(p.get("position_fp", p.get("position", 0)) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty == 0:
+            continue
+        if qty < 0:
+            print(f"[info] posicion manual {ticker}: es del lado NO ({qty}); no se vigila")
+            continue
+        exposure_c = _dollars_to_cents(p.get("market_exposure_dollars"))
+        if exposure_c is None or qty <= 0:
+            print(f"[info] posicion manual {ticker}: sin costo en la API, no se puede vigilar. Datos: {str(p)[:300]}")
+            continue
+        avg_cost = exposure_c / qty
+        try:
+            market = public_client.get_market(ticker)
+            market = market.get("market", market) if isinstance(market, dict) else {}
+        except Exception as exc:
+            print(f"[warn] posicion manual {ticker}: no se pudo leer el precio ({str(exc)[:100]})")
+            continue
+        bid_c = _dollars_to_cents(market.get("yes_bid_dollars"))
+        if bid_c is None:
+            continue
+        bid_c = round(bid_c)
+        print(f"[info] vigilando posicion manual {ticker}: {qty:g} contratos, costo medio {avg_cost:.0f}c, bid {bid_c}c")
+        if bid_c <= 0 or bid_c > avg_cost - MANUAL_STOP_CENTS:
+            continue
+        sell_price = max(1, bid_c - SL_SLIPPAGE_CENTS)
+        count = int(qty)
+        if count <= 0:
+            continue
+        try:
+            resp = trading_client.create_order(
+                ticker=ticker, side="yes", action="sell", count=count, price_cents=sell_price, reduce_only=True,
+            )
+        except Exception as exc:
+            print(f"[warn] no se pudo cerrar la posicion manual {ticker}: {exc}")
+            continue
+        filled, avg_exit = parse_fill(resp)
+        if filled <= 0:
+            print(f"[info] cierre de la posicion manual {ticker} no se lleno; se reintenta")
+            continue
+        exit_c = avg_exit if avg_exit is not None else sell_price
+        print(f"[info] posicion manual {ticker} cerrada por proteccion: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {round((exit_c - avg_cost) * filled)}c)")
+
+
 def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient, series_tickers: list[str]) -> None:
     busy = kalshi_busy_tickers(trading_client)
     if busy is None:
@@ -607,6 +682,9 @@ def main() -> None:
         with conn.cursor() as cur:
             manage_open_positions(cur, public_client, trading_client)
             conn.commit()
+
+        with conn.cursor() as cur:
+            protect_manual_positions(cur, public_client, trading_client)
 
         with conn.cursor() as cur:
             backfill_settled_pnl(cur, public_client)
