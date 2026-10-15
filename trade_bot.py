@@ -49,6 +49,18 @@ MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
 # puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
 # compra en mercados cuyo bolsillo tiene saldo suficiente.
 POCKET_CHECK = os.environ.get("STRAT_POCKET_CHECK", "1").strip().lower() in ("1", "true", "yes", "si")
+# Con STRAT_AUTO_REBALANCE=1 (por defecto) el bot le pide a Kalshi, al inicio
+# de cada corrida, que reparta el saldo en partes iguales entre los bolsillos
+# que existan (target_balance_allocation). Kalshi mueve fondos solo cada
+# ~10s hacia ese reparto; no es instantaneo, por eso ademas existe
+# STRAT_POCKET_AUTOFUND para el momento exacto de comprar.
+AUTO_REBALANCE = os.environ.get("STRAT_AUTO_REBALANCE", "1").strip().lower() in ("1", "true", "yes", "si")
+# Con STRAT_POCKET_AUTOFUND=1 (por defecto) el bot, antes de omitir una compra
+# por falta de saldo en su bolsillo, intenta transferirle lo que falta desde
+# el bolsillo con mas sobrante. Si la transferencia no llega a tiempo (es
+# asincrona) o falla, se cae al comportamiento de siempre: se omite el
+# mercado y sigue con el resto.
+POCKET_AUTOFUND = os.environ.get("STRAT_POCKET_AUTOFUND", "1").strip().lower() in ("1", "true", "yes", "si")
 # Vigila las posiciones que pones a mano en Kalshi (las que no abrio el bot) y
 # las cierra si caen MANUAL_STOP_CENTS por debajo de su costo promedio.
 # Nunca las cierra por ganancia.
@@ -121,6 +133,54 @@ def cancel_all_resting_orders(trading_client: KalshiTradingClient) -> None:
             print(f"[info] cancelada: {ticker} ({order_id})")
         except Exception as exc:
             print(f"[warn] no se pudo cancelar {ticker} ({order_id}): {exc}")
+
+
+def ensure_even_target_allocation(trading_client: KalshiTradingClient, pockets: dict[int, float]) -> None:
+    """Le pide a Kalshi repartir el saldo en partes iguales entre los
+    bolsillos que existan hoy (STRAT_AUTO_REBALANCE=1). Kalshi lo aplica de
+    fondo cada ~10s; esta llamada solo fija el objetivo, no mueve dinero ella
+    misma. Se llama una vez por corrida; si falla, no detiene el bot."""
+    if not pockets:
+        return
+    n = len(pockets)
+    base = 100 // n
+    allocations = {idx: base for idx in pockets}
+    # Reparte el residuo del redondeo en el primer bolsillo para que sume 100.
+    first = sorted(allocations)[0]
+    allocations[first] += 100 - base * n
+    try:
+        trading_client.set_target_balance_allocation(allocations)
+        print(f"[info] reparto objetivo de saldo pedido a Kalshi: {allocations}")
+    except Exception as exc:
+        print(f"[warn] no se pudo fijar el reparto objetivo de saldo: {str(exc)[:200]}")
+
+
+def autofund_pocket(trading_client: KalshiTradingClient, pockets: dict[int, float], pocket: int, needed_cents: float) -> bool:
+    """Intenta cubrir `needed_cents` en `pocket` transfiriendolo desde el
+    bolsillo con mas sobrante. Actualiza `pockets` de forma optimista si la
+    transferencia se acepta (es asincrona del lado de Kalshi, puede tardar
+    unos segundos en reflejarse de verdad). Devuelve True si se pidio la
+    transferencia, False si no habia de donde sacar el dinero o fallo."""
+    shortfall = needed_cents - pockets.get(pocket, 0.0)
+    if shortfall <= 0:
+        return False
+    donor = max(
+        (idx for idx in pockets if idx != pocket),
+        key=lambda idx: pockets[idx],
+        default=None,
+    )
+    if donor is None or pockets[donor] <= shortfall:
+        return False
+    amount = min(shortfall, pockets[donor])
+    try:
+        trading_client.transfer_between_pockets(donor, pocket, amount)
+        print(f"[info] transferencia pedida: ${amount:.2f} del bolsillo {donor} al {pocket}")
+        pockets[donor] -= amount
+        pockets[pocket] = pockets.get(pocket, 0.0) + amount
+        return True
+    except Exception as exc:
+        print(f"[warn] no se pudo transferir del bolsillo {donor} al {pocket}: {str(exc)[:200]}")
+        return False
 
 
 def reopen_wrongly_settled(conn, cur, trading_client: KalshiTradingClient) -> None:
@@ -593,6 +653,8 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             bd = trading_client.get_balance().get("balance_breakdown") or []
             pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
             print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
+            if AUTO_REBALANCE:
+                ensure_even_target_allocation(trading_client, pockets)
         except Exception as bexc:
             print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
     skipped_pockets: set[int] = set()
@@ -637,12 +699,15 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
 
         pocket = market.get("exchange_index")
         if pockets is not None and pocket is not None:
+            pocket = int(pocket)
             cost = FIXED_CONTRACTS * yes_ask_cents / 100.0
-            if pockets.get(int(pocket), 0.0) < cost + 0.05:
-                if int(pocket) not in skipped_pockets:
-                    skipped_pockets.add(int(pocket))
-                    print(f"[info] bolsillo {pocket} sin saldo suficiente (${pockets.get(int(pocket), 0.0):.2f}); se omiten sus mercados")
-                continue
+            if pockets.get(pocket, 0.0) < cost + 0.05:
+                moved = POCKET_AUTOFUND and autofund_pocket(trading_client, pockets, pocket, cost + 0.05)
+                if not moved and pockets.get(pocket, 0.0) < cost + 0.05:
+                    if pocket not in skipped_pockets:
+                        skipped_pockets.add(pocket)
+                        print(f"[info] bolsillo {pocket} sin saldo suficiente (${pockets.get(pocket, 0.0):.2f}); se omiten sus mercados")
+                    continue
 
         try:
             resp = trading_client.create_order(

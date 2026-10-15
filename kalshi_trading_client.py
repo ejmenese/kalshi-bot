@@ -85,6 +85,55 @@ class KalshiTradingClient:
     def get_positions(self) -> dict[str, Any]:
         return self._get("/portfolio/positions")
 
+    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        resp = self.session.post(
+            self.base_url + path,
+            headers={**self._headers("POST", "/trade-api/v2" + path), "Content-Type": "application/json"},
+            json=body,
+            timeout=10,
+        )
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason}: {resp.text[:300]}", response=resp
+            )
+        return resp.json() if resp.text else {}
+
+    def set_target_balance_allocation(
+        self,
+        allocations: dict[int, int],
+        resting_margin_reservation: str = "sum",
+    ) -> dict[str, Any]:
+        """Configura el reparto objetivo de saldo entre bolsillos (exchange_index).
+        Kalshi mueve fondos solo cada ~10s para acercarse a estos porcentajes
+        (POST /portfolio/target_balance_allocation). `allocations` es
+        {exchange_index: percent}; los percent deben sumar 100."""
+        body = {
+            "allocations": [
+                {"exchange_index": int(idx), "percent": int(pct)}
+                for idx, pct in allocations.items()
+            ],
+            "resting_margin_reservation": resting_margin_reservation,
+        }
+        return self._post("/portfolio/target_balance_allocation", body)
+
+    def transfer_between_pockets(self, source_pocket: int, destination_pocket: int, amount_cents: float) -> dict[str, Any]:
+        """Mueve dinero entre bolsillos (exchange shards) del mismo tipo de
+        cuenta (event_contract), vía POST /portfolio/intra_exchange_instance_transfer.
+        `amount_cents` esta en centavos de dolar; la API de Kalshi la recibe
+        en 'centicentavos' (1 centavo = 100 centicentavos), asi que se
+        convierte aqui para no exponer esa unidad rara al resto del bot."""
+        amount_centicents = int(round(amount_cents * 100))
+        if amount_centicents <= 0:
+            raise ValueError(f"amount_cents debe ser positivo: {amount_cents}")
+        body = {
+            "source": "event_contract",
+            "destination": "event_contract",
+            "source_exchange_shard": int(source_pocket),
+            "destination_exchange_shard": int(destination_pocket),
+            "amount": amount_centicents,
+        }
+        return self._post("/portfolio/intra_exchange_instance_transfer", body)
+
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         """Cancela una orden que sigue 'resting' (sin llenar) en el libro.
         DELETE /portfolio/orders/{order_id} segun el Trade API v2 de Kalshi."""
