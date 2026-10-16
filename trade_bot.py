@@ -626,6 +626,24 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         cur.execute("SELECT ticker FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
         return len(busy | {r[0] for r in cur.fetchall()})
 
+    # El reparto objetivo de saldo se pide SIEMPRE, incluso si esta corrida no
+    # va a buscar entradas nuevas (limite de posiciones, de entradas por hora,
+    # o de perdida). Antes esto estaba despues de esos "return" tempranos, asi
+    # que si el bot estaba lleno de posiciones (lo normal con 7 abiertas de
+    # limite) el rebalanceo nunca se llegaba a pedir. Pidiendolo aqui arriba,
+    # Kalshi ya va dejando el saldo repartido mientras el bot espera a que se
+    # libere un cupo, en vez de recien reaccionar cuando ya hace falta comprar.
+    pockets: dict[int, float] | None = None
+    if POCKET_CHECK:
+        try:
+            bd = trading_client.get_balance().get("balance_breakdown") or []
+            pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
+            print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
+            if AUTO_REBALANCE:
+                ensure_even_target_allocation(trading_client, pockets)
+        except Exception as bexc:
+            print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
+
     if total_open() >= MAX_OPEN_POSITIONS:
         print("[info] maximo de posiciones abiertas alcanzado, no se buscan nuevas entradas")
         return
@@ -647,16 +665,6 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                 print(f"[warn] no se pudo leer la serie {series}: {exc}")
             time.sleep(SERIES_PAUSE_SECONDS)
 
-    pockets: dict[int, float] | None = None
-    if POCKET_CHECK:
-        try:
-            bd = trading_client.get_balance().get("balance_breakdown") or []
-            pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
-            print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
-            if AUTO_REBALANCE:
-                ensure_even_target_allocation(trading_client, pockets)
-        except Exception as bexc:
-            print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
     skipped_pockets: set[int] = set()
     insufficient_fails = 0
     for market in iter_markets():
