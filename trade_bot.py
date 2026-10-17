@@ -192,7 +192,14 @@ def rebalance_pockets_explicitly(trading_client: KalshiTradingClient, pockets: d
                 continue
             amount = min(surplus[s_idx], need)
             try:
-                trading_client.transfer_between_pockets(s_idx, d_idx, amount)
+                # transfer_between_pockets espera el monto en CENTAVOS (lo
+                # multiplica x100 para mandarselo a Kalshi en centicentavos);
+                # `amount` aqui esta en DOLARES porque `pockets` viene de
+                # get_balance() en dolares. Sin este x100, cada transferencia
+                # quedaba 100 veces mas chica de lo pedido -- confirmado en
+                # logs: se pidieron $14.31 a cada bolsillo y solo llegaron
+                # $0.14 (2026-10-17, corridas de las 12:30 y 13:45 UTC).
+                trading_client.transfer_between_pockets(s_idx, d_idx, amount * 100)
                 print(f"[info] rebalance explicito: ${amount:.2f} del bolsillo {s_idx} al {d_idx}")
                 pockets[s_idx] -= amount
                 pockets[d_idx] = pockets.get(d_idx, 0.0) + amount
@@ -223,7 +230,11 @@ def autofund_pocket(trading_client: KalshiTradingClient, pockets: dict[int, floa
         return False
     amount = min(shortfall, pockets[donor])
     try:
-        trading_client.transfer_between_pockets(donor, pocket, amount)
+        # Mismo bug de unidades que en rebalance_pockets_explicitly: `amount`
+        # esta en DOLARES (pockets viene de get_balance() en dolares) pero
+        # transfer_between_pockets espera CENTAVOS. Sin el x100 esto llevaba
+        # desde el 15 oct transfiriendo 100 veces menos de lo pedido.
+        trading_client.transfer_between_pockets(donor, pocket, amount * 100)
         print(f"[info] transferencia pedida: ${amount:.2f} del bolsillo {donor} al {pocket}")
         pockets[donor] -= amount
         pockets[pocket] = pockets.get(pocket, 0.0) + amount
