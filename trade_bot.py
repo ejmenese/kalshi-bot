@@ -807,6 +807,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
 
 
 def main() -> None:
+    print(f"[info] ambiente: {BOT_ENV} (KALSHI_ENV={os.environ.get('KALSHI_ENV', 'demo')!r})")
     all_series = resolve_series(os.environ.get("KALSHI_SERIES", "ALL_SPORTS"))
     series_tickers = [s for s in all_series if series_allowed(s)]
     skipped = [s for s in all_series if not series_allowed(s)]
