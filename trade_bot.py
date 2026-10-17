@@ -98,7 +98,9 @@ SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"
 RUN_LOCK_ID = 774411
 
 # Series y mercados que NO son "quien gana": marcadores exactos, empates, etc.
-EXCLUDED_SERIES_WORDS = ("EXACT", "SCORE", "SPREAD", "TOTAL", "PROP")
+# PICKLEBALL se excluye aqui a propósito: Kalshi lo etiqueta con "Tennis" (por
+# eso pasa el filtro STRAT_INCLUDE_TAGS), pero no es tenis.
+EXCLUDED_SERIES_WORDS = ("EXACT", "SCORE", "SPREAD", "TOTAL", "PROP", "PICKLEBALL")
 EXCLUDED_MARKET_SUFFIXES = ("-TIE", "-DRAW")
 
 
