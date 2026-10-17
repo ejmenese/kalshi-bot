@@ -45,6 +45,12 @@ LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
 GAME_COOLDOWN_HOURS = int(os.environ.get("STRAT_GAME_COOLDOWN_HOURS", "24"))
 # Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
 MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
+# El cron sigue corriendo cada 15 min (Render) para vigilar y proteger las
+# posiciones abiertas, pero la BUSQUEDA de entradas nuevas solo se hace una
+# vez cada STRAT_ENTRY_SCAN_MINUTES (60 por defecto = "cada hora, 24/7").
+# Asi se baja la frecuencia de abrir posiciones nuevas sin dejar de vigilar
+# las que ya estan abiertas con la frecuencia de siempre.
+ENTRY_SCAN_INTERVAL_MINUTES = int(os.environ.get("STRAT_ENTRY_SCAN_MINUTES", "60"))
 # Kalshi reparte el saldo en "bolsillos" (exchange_index) y cada mercado solo
 # puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
 # compra en mercados cuyo bolsillo tiene saldo suficiente.
@@ -300,6 +306,11 @@ CREATE TABLE IF NOT EXISTS kalshi_trades (
     closed_at     TIMESTAMPTZ
 );
 ALTER TABLE kalshi_trades ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'demo';
+CREATE TABLE IF NOT EXISTS bot_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -308,6 +319,32 @@ def get_conn():
     if not database_url:
         raise RuntimeError("falta DATABASE_URL en el entorno")
     return psycopg2.connect(database_url)
+
+
+def entries_scan_due(cur) -> bool:
+    """True solo si ya pasaron ENTRY_SCAN_INTERVAL_MINUTES desde la ultima vez
+    que esta corrida (cualquier instancia del cron) busco entradas nuevas.
+    Si da luz verde, marca el intento de una vez (misma transaccion del
+    llamador) para que las corridas de los proximos ~60 min se salten la
+    busqueda, aunque el cron de Render siga disparando cada 15 min para
+    vigilar las posiciones abiertas."""
+    cur.execute(
+        """
+        SELECT 1 FROM bot_state
+        WHERE key = 'last_entry_scan'
+          AND updated_at >= now() - (%s * interval '1 minute')
+        """,
+        (ENTRY_SCAN_INTERVAL_MINUTES,),
+    )
+    if cur.fetchone():
+        return False
+    cur.execute(
+        """
+        INSERT INTO bot_state (key, value, updated_at) VALUES ('last_entry_scan', 'ok', now())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+        """
+    )
+    return True
 
 
 def recent_realized_pnl_cents(cur) -> int:
@@ -813,8 +850,14 @@ def main() -> None:
             print("[info] STRAT_ENTRIES_PAUSED activo: no se abren posiciones nuevas (las abiertas siguen vigiladas)")
         else:
             with conn.cursor() as cur:
-                look_for_entries(conn, cur, public_client, trading_client, series_tickers)
+                due = entries_scan_due(cur)
                 conn.commit()
+            if not due:
+                print(f"[info] todavia no pasan los {ENTRY_SCAN_INTERVAL_MINUTES} min desde la ultima busqueda de entradas nuevas; esta corrida solo vigilo las posiciones abiertas")
+            else:
+                with conn.cursor() as cur:
+                    look_for_entries(conn, cur, public_client, trading_client, series_tickers)
+                    conn.commit()
     finally:
         conn.close()
 
