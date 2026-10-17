@@ -680,6 +680,20 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
             if AUTO_REBALANCE:
                 ensure_even_target_allocation(trading_client, pockets)
+                try:
+                    current_target = trading_client.get_target_balance_allocation()
+                    print(f"[info] reparto objetivo que Kalshi tiene guardado ahora: {current_target}")
+                except Exception as texc:
+                    print(f"[warn] no se pudo leer el reparto objetivo guardado: {str(texc)[:200]}")
+                try:
+                    resting = trading_client.get_resting_orders().get("orders") or []
+                    held_by_pocket: dict[int, float] = {}
+                    for o in resting:
+                        idx = int(o.get("exchange_index", -1))
+                        held_by_pocket[idx] = held_by_pocket.get(idx, 0.0) + float(o.get("yes_price", o.get("no_price", 0)) or 0) * int(o.get("remaining_count", o.get("count", 0)) or 0) / 100
+                    print(f"[info] {len(resting)} ordenes resting; saldo retenido estimado por bolsillo: {held_by_pocket}")
+                except Exception as rexc:
+                    print(f"[warn] no se pudo calcular saldo retenido por ordenes resting: {str(rexc)[:200]}")
         except Exception as bexc:
             print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
 

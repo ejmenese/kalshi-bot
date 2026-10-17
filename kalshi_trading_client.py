@@ -85,6 +85,13 @@ class KalshiTradingClient:
     def get_positions(self) -> dict[str, Any]:
         return self._get("/portfolio/positions")
 
+    def get_target_balance_allocation(self) -> dict[str, Any]:
+        """Lee el reparto objetivo que Kalshi tiene guardado para esta cuenta
+        (GET /portfolio/target_balance_allocation) -- para confirmar si el
+        set_target_balance_allocation de abajo de verdad quedo registrado del
+        lado de Kalshi, en vez de asumirlo por el 200 OK de la respuesta."""
+        return self._get("/portfolio/target_balance_allocation")
+
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         resp = self.session.post(
             self.base_url + path,
