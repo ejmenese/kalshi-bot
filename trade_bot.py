@@ -349,6 +349,44 @@ def entries_scan_due(cur) -> bool:
     return True
 
 
+def print_pnl_summary(cur) -> None:
+    """Resumen de ganancias/perdidas cerradas, por estado y por serie, para
+    diagnosticar por que hay mas perdidas que ganancias. Solo lectura, se
+    imprime siempre al inicio de la corrida (env=BOT_ENV)."""
+    cur.execute(
+        """
+        SELECT status, COUNT(*), COALESCE(SUM(pnl_cents), 0), COALESCE(AVG(pnl_cents), 0)
+        FROM kalshi_trades WHERE env = %s AND status != 'open'
+        GROUP BY status ORDER BY status
+        """,
+        (BOT_ENV,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print(f"[stats] sin trades cerrados todavia en env={BOT_ENV}")
+        return
+    total_n = sum(r[1] for r in rows)
+    total_pnl = sum(r[2] for r in rows)
+    print(f"[stats] === resumen de P&L (env={BOT_ENV}): {total_n} trades cerrados, pnl total {total_pnl}c ===")
+    for status, n, total, avg in rows:
+        print(f"[stats]   {status}: {n} trades, pnl total {total}c, promedio {avg:.1f}c/trade")
+
+    cur.execute(
+        """
+        SELECT split_part(ticker, '-', 1) AS serie, COUNT(*),
+               COALESCE(SUM(pnl_cents), 0) AS pnl_total,
+               SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
+               SUM(CASE WHEN pnl_cents <= 0 THEN 1 ELSE 0 END) AS losses
+        FROM kalshi_trades WHERE env = %s AND status != 'open'
+        GROUP BY serie ORDER BY pnl_total ASC
+        """,
+        (BOT_ENV,),
+    )
+    print(f"[stats] por serie (peor a mejor):")
+    for serie, n, total, wins, losses in cur.fetchall():
+        print(f"[stats]   {serie}: {n} trades ({wins}W/{losses}L), pnl total {total}c")
+
+
 def recent_realized_pnl_cents(cur) -> int:
     """Ganancia/perdida realizada en las ultimas LOSS_WINDOW_HOURS horas."""
     cur.execute(
@@ -845,6 +883,9 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
             conn.commit()
+
+        with conn.cursor() as cur:
+            print_pnl_summary(cur)
 
         if CANCEL_ALL_ORDERS:
             cancel_all_resting_orders(trading_client)
