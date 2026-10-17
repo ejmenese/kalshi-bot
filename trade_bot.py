@@ -163,6 +163,48 @@ def ensure_even_target_allocation(trading_client: KalshiTradingClient, pockets: 
         print(f"[warn] no se pudo fijar el reparto objetivo de saldo: {str(exc)[:200]}")
 
 
+def rebalance_pockets_explicitly(trading_client: KalshiTradingClient, pockets: dict[int, float]) -> None:
+    """Transfiere saldo de verdad entre bolsillos para acercarlos a partes
+    iguales, en vez de depender solo de ensure_even_target_allocation.
+
+    Se agrega esto porque, revisando logs de Render de mas de 24h seguidas
+    (15 oct 13:30 a 16 oct 17:00), con el reparto objetivo fijado en
+    25/25/25/25 en TODAS las corridas, el bolsillo 0 se quedo con el saldo
+    entero sin moverse ni un centavo mientras los bolsillos 1-3 seguian en
+    $0.00. target_balance_allocation parece gobernar solo saldo NUEVO que
+    entra (liquidaciones, depositos) -- no reparte retroactivamente el saldo
+    que ya esta quieto en un bolsillo. Por eso aqui se hacen transferencias
+    explicitas (transfer_between_pockets), que si movieron plata de verdad
+    segun los mismos logs."""
+    if not pockets or len(pockets) < 2:
+        return
+    total = sum(pockets.values())
+    target = total / len(pockets)
+    THRESHOLD = 1.0  # no vale la pena mover centavos sueltos cada corrida
+    surplus = {idx: bal - target for idx, bal in pockets.items() if bal - target > THRESHOLD}
+    deficits = {idx: target - bal for idx, bal in pockets.items() if target - bal > THRESHOLD}
+    if not surplus or not deficits:
+        return
+    for d_idx in sorted(deficits, key=lambda i: -deficits[i]):
+        need = deficits[d_idx]
+        for s_idx in sorted(surplus, key=lambda i: -surplus[i]):
+            if need <= 0.01 or surplus.get(s_idx, 0.0) <= 0.01:
+                continue
+            amount = min(surplus[s_idx], need)
+            try:
+                trading_client.transfer_between_pockets(s_idx, d_idx, amount)
+                print(f"[info] rebalance explicito: ${amount:.2f} del bolsillo {s_idx} al {d_idx}")
+                pockets[s_idx] -= amount
+                pockets[d_idx] = pockets.get(d_idx, 0.0) + amount
+                surplus[s_idx] -= amount
+                need -= amount
+            except Exception as exc:
+                print(f"[warn] no se pudo rebalancear del bolsillo {s_idx} al {d_idx}: {str(exc)[:200]}")
+                break
+        if need <= 0.01:
+            continue
+
+
 def autofund_pocket(trading_client: KalshiTradingClient, pockets: dict[int, float], pocket: int, needed_cents: float) -> bool:
     """Intenta cubrir `needed_cents` en `pocket` transfiriendolo desde el
     bolsillo con mas sobrante. Actualiza `pockets` de forma optimista si la
@@ -718,6 +760,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
             if AUTO_REBALANCE:
                 ensure_even_target_allocation(trading_client, pockets)
+                rebalance_pockets_explicitly(trading_client, pockets)
                 try:
                     current_target = trading_client.get_target_balance_allocation()
                     print(f"[info] reparto objetivo que Kalshi tiene guardado ahora: {current_target}")
