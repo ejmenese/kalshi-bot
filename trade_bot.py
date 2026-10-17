@@ -802,7 +802,23 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             cost = FIXED_CONTRACTS * yes_ask_cents / 100.0
             if pockets.get(pocket, 0.0) < cost + 0.05:
                 moved = POCKET_AUTOFUND and autofund_pocket(trading_client, pockets, pocket, cost + 0.05)
-                if not moved and pockets.get(pocket, 0.0) < cost + 0.05:
+                if moved:
+                    # La transferencia recien pedida es asincrona del lado de
+                    # Kalshi (tarda ~10s en reflejarse de verdad). Comprar
+                    # ahora mismo, en la misma corrida, todavia pega contra el
+                    # saldo viejo y rebota con insufficient_balance -- eso es
+                    # justo lo que se veia en los logs: se gastaban los 3
+                    # intentos de la corrida entera en esto y se cortaba la
+                    # busqueda para TODOS los bolsillos, no solo el corto.
+                    # En vez de intentar comprar igual, se omite este mercado
+                    # y se sigue con el resto; la proxima corrida (15 min
+                    # despues, de sobra para que la transferencia se asiente)
+                    # ya va a tener el saldo real.
+                    if pocket not in skipped_pockets:
+                        skipped_pockets.add(pocket)
+                        print(f"[info] bolsillo {pocket} sin saldo suficiente; transferencia pedida, se reintenta en la proxima corrida")
+                    continue
+                if pockets.get(pocket, 0.0) < cost + 0.05:
                     if pocket not in skipped_pockets:
                         skipped_pockets.add(pocket)
                         print(f"[info] bolsillo {pocket} sin saldo suficiente (${pockets.get(pocket, 0.0):.2f}); se omiten sus mercados")
