@@ -115,6 +115,14 @@ ALL_SPORTS_KEYWORD = "ALL_SPORTS"
 # de Kalshi). Ademas trade_bot.py aplica STRAT_EXCLUDE_WORDS sobre el ticker.
 EXCLUDE_TAGS = {t.strip().lower() for t in os.environ.get("STRAT_EXCLUDE_TAGS", "").split(",") if t.strip()}
 
+# Opuesto de EXCLUDE_TAGS: si STRAT_INCLUDE_TAGS tiene valor (p. ej.
+# "Football,Tennis"), SOLO se operan series con alguna de esas etiquetas de
+# Kalshi; las demas se descartan aunque no esten en EXCLUDE_TAGS. Vacio =
+# sin restriccion (se opera en todos los deportes, como antes). Las
+# etiquetas de Kalshi para NFL y NCAAF son ambas "Football"; para ATP/WTA es
+# "Tennis" -- confirmado contra /trade-api/v2/series antes de usarlo aqui.
+INCLUDE_TAGS = {t.strip().lower() for t in os.environ.get("STRAT_INCLUDE_TAGS", "").split(",") if t.strip()}
+
 
 def discover_sports_game_series(timeout_seconds: float = 15.0) -> list[str]:
     """Pide a Kalshi todas las series de la categoria Sports y se queda con
@@ -150,6 +158,8 @@ def discover_sports_game_series(timeout_seconds: float = 15.0) -> list[str]:
                 continue
             tags = {str(t).strip().lower() for t in (serie.get("tags") or [])}
             if tags & EXCLUDE_TAGS:
+                continue
+            if INCLUDE_TAGS and not (tags & INCLUDE_TAGS):
                 continue
             found.add(ticker)
         cursor = data.get("cursor")
