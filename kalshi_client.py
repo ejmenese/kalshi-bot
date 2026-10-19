@@ -99,10 +99,17 @@ class KalshiClient:
 # --- Descubrimiento automatico de series deportivas -----------------------
 
 # Series de "quien gana" por partido/pelea. Se usan como respaldo si Kalshi no
-# responde al pedir la lista de series.
+# responde al pedir la lista de series. OJO: esta lista no tiene las etiquetas
+# de Kalshi (tags), asi que no se puede filtrar por STRAT_INCLUDE_TAGS /
+# STRAT_EXCLUDE_TAGS como se hace con el descubrimiento normal. Bug real
+# encontrado el 19 oct: con STRAT_INCLUDE_TAGS="Football,Tennis" puesto, dos
+# timeouts de /series (18 oct 20:01 y 20:15 UTC) hicieron que esta lista
+# completa (que incluia MLB/NBA/WNBA/NHL/EPL) se usara sin filtrar -- ningun
+# trade llego a abrirse en esos dos casos puntuales, pero el riesgo quedaba
+# latente para la proxima vez. Por eso el respaldo ahora solo trae futbol
+# americano y tenis, igual que el descubrimiento normal ya filtra.
 FALLBACK_SPORTS_SERIES = [
-    "KXMLBGAME", "KXNFLGAME", "KXNCAAFGAME", "KXNBAGAME", "KXWNBAGAME",
-    "KXNHLGAME", "KXATPMATCH", "KXWTAMATCH", "KXEPLGAME",
+    "KXNFLGAME", "KXNCAAFGAME", "KXATPMATCH", "KXWTAMATCH",
 ]
 
 # Sufijos de ticker que identifican mercados de ganador de un partido,
