@@ -468,17 +468,41 @@ def event_of(ticker: str) -> str:
 
 
 def game_recently_traded(cur, ticker: str) -> bool:
-    """True si ya no se puede entrar mas en este partido: se alcanzo
-    MAX_ENTRIES_PER_GAME contando TODAS las operaciones (abiertas o ya
-    cerradas) en cualquier mercado de ese partido. Permite montar y liquidar
-    varias veces seguidas en el mismo partido -- la entrada simultanea a los
-    dos lados (o una segunda mientras la primera sigue abierta) la bloquea
-    por separado el chequeo de 'busy' por evento en look_for_entries."""
+    """True si ya no se puede entrar mas en este partido, por cualquiera de
+    estos dos motivos:
+    1. Se alcanzo MAX_ENTRIES_PER_GAME contando TODAS las operaciones
+       (abiertas o ya cerradas) en cualquier mercado de ese partido.
+    2. La ULTIMA operacion cerrada de ese partido no cerro en ganancia
+       (pnl_cents <= 0). La cadena de "montar y liquidar" solo sigue
+       mientras cada paso va ganando; si una cierra en perdida o en cero,
+       no se monta la siguiente en ese mismo partido (tenis y futbol
+       americano por igual).
+    La entrada simultanea a los dos lados (o una segunda mientras la
+    primera sigue abierta) la bloquea por separado el chequeo de 'busy'
+    por evento en look_for_entries."""
+    event_pattern = event_of(ticker) + "-%"
+
     cur.execute(
         "SELECT COUNT(*) FROM kalshi_trades WHERE ticker LIKE %s AND env = %s",
-        (event_of(ticker) + "-%", BOT_ENV),
+        (event_pattern, BOT_ENV),
     )
-    return cur.fetchone()[0] >= MAX_ENTRIES_PER_GAME
+    if cur.fetchone()[0] >= MAX_ENTRIES_PER_GAME:
+        return True
+
+    cur.execute(
+        """
+        SELECT pnl_cents FROM kalshi_trades
+        WHERE ticker LIKE %s AND env = %s AND status != 'open' AND pnl_cents IS NOT NULL
+        ORDER BY closed_at DESC
+        LIMIT 1
+        """,
+        (event_pattern, BOT_ENV),
+    )
+    row = cur.fetchone()
+    if row is not None and row[0] <= 0:
+        return True
+
+    return False
 
 
 def entries_last_hour(cur) -> int:
