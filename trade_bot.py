@@ -45,9 +45,13 @@ DAILY_LOSS_LIMIT_CENTS = int(os.environ.get("STRAT_DAILY_LOSS_LIMIT_CENTS", "500
 # Tope de perdida en ventana movil (antes era por dia UTC y se reiniciaba a
 # las 6 p. m. hora de Mexico/Centroamerica).
 LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
-# Despues de operar un partido (abierto o cerrado), no se vuelve a entrar en
-# ningun mercado de ese mismo partido durante estas horas.
-GAME_COOLDOWN_HOURS = int(os.environ.get("STRAT_GAME_COOLDOWN_HOURS", "24"))
+# Maximo de entradas (abiertas + cerradas, sumadas) que se permiten en el
+# mismo partido. Antes esto era, en la practica, 1 (cualquier operacion en el
+# partido bloqueaba reentrar por 24h via game_recently_traded). Ahora permite
+# montar y liquidar varias veces seguidas en el mismo partido -- nunca al
+# mismo tiempo (eso lo sigue evitando el chequeo de "busy" por evento en
+# look_for_entries), siempre una cerrada antes de abrir la siguiente.
+MAX_ENTRIES_PER_GAME = int(os.environ.get("STRAT_MAX_ENTRIES_PER_GAME", "3"))
 # Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
 MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
 # El cron sigue corriendo cada 15 min (Render) para vigilar y proteger las
@@ -464,19 +468,17 @@ def event_of(ticker: str) -> str:
 
 
 def game_recently_traded(cur, ticker: str) -> bool:
-    """True si ya hay (o hubo hace menos de GAME_COOLDOWN_HOURS) una operacion
-    en cualquier mercado del mismo partido. Evita re-entrar tras un stop-loss
-    y evita apostar a los dos lados del mismo partido."""
+    """True si ya no se puede entrar mas en este partido: se alcanzo
+    MAX_ENTRIES_PER_GAME contando TODAS las operaciones (abiertas o ya
+    cerradas) en cualquier mercado de ese partido. Permite montar y liquidar
+    varias veces seguidas en el mismo partido -- la entrada simultanea a los
+    dos lados (o una segunda mientras la primera sigue abierta) la bloquea
+    por separado el chequeo de 'busy' por evento en look_for_entries."""
     cur.execute(
-        """
-        SELECT 1 FROM kalshi_trades
-        WHERE ticker LIKE %s AND env = %s
-          AND (status = 'open' OR opened_at >= now() - (%s * interval '1 hour'))
-        LIMIT 1
-        """,
-        (event_of(ticker) + "-%", BOT_ENV, GAME_COOLDOWN_HOURS),
+        "SELECT COUNT(*) FROM kalshi_trades WHERE ticker LIKE %s AND env = %s",
+        (event_of(ticker) + "-%", BOT_ENV),
     )
-    return cur.fetchone() is not None
+    return cur.fetchone()[0] >= MAX_ENTRIES_PER_GAME
 
 
 def entries_last_hour(cur) -> int:
