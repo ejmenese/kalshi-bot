@@ -78,6 +78,12 @@ RESCUE_DOLLARS = float(os.environ.get("STRAT_RESCUE_DOLLARS", "2"))
 # Asi se baja la frecuencia de abrir posiciones nuevas sin dejar de vigilar
 # las que ya estan abiertas con la frecuencia de siempre.
 ENTRY_SCAN_INTERVAL_MINUTES = int(os.environ.get("STRAT_ENTRY_SCAN_MINUTES", "60"))
+# Si un mercado se abrio hace menos de estos minutos (el partido acaba de
+# arrancar), se adelanta la busqueda de entradas sin esperar a que pase la
+# hora completa -- recien empezado el partido suele haber mas oportunidades
+# de precio que mas tarde. El cron sigue corriendo cada 15 min, asi que en el
+# peor caso se detecta dentro de esa ventana de 15 min, no al instante exacto.
+NEW_GAME_WINDOW_MINUTES = int(os.environ.get("STRAT_NEW_GAME_WINDOW_MINUTES", "20"))
 # Kalshi reparte el saldo en "bolsillos" (exchange_index) y cada mercado solo
 # puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
 # compra en mercados cuyo bolsillo tiene saldo suficiente.
@@ -420,13 +426,38 @@ def entries_scan_due(cur) -> bool:
     )
     if cur.fetchone():
         return False
+    mark_entry_scan_done(cur)
+    return True
+
+
+def mark_entry_scan_done(cur) -> None:
+    """Reinicia el reloj de ENTRY_SCAN_INTERVAL_MINUTES a partir de ahora."""
     cur.execute(
         """
         INSERT INTO bot_state (key, value, updated_at) VALUES ('last_entry_scan', 'ok', now())
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
         """
     )
-    return True
+
+
+def has_new_game(public_client: KalshiClient, series_tickers: list[str]) -> bool:
+    """True si hay al menos un mercado (en alguna de las series ya permitidas)
+    que abrio para operar hace menos de NEW_GAME_WINDOW_MINUTES -- senal de
+    que un partido acaba de arrancar. Se usa para adelantar la busqueda de
+    entradas sin esperar a que pase la hora completa."""
+    now = datetime.now(timezone.utc)
+    for series in series_tickers:
+        try:
+            for m in public_client.get_open_markets_for_series(series):
+                open_dt = _parse_kalshi_time(m.get("open_time"))
+                if open_dt is None:
+                    continue
+                minutes_open = (now - open_dt).total_seconds() / 60.0
+                if 0 <= minutes_open <= NEW_GAME_WINDOW_MINUTES:
+                    return True
+        except Exception as exc:
+            print(f"[warn] no se pudo revisar partidos nuevos en {series}: {exc}")
+    return False
 
 
 def print_pnl_summary(cur) -> None:
@@ -483,6 +514,17 @@ def recent_realized_pnl_cents(cur) -> int:
 def event_of(ticker: str) -> str:
     """KXAPFDDHGAME-26OCT03RECLIB-REC -> KXAPFDDHGAME-26OCT03RECLIB (el partido)."""
     return ticker.rsplit("-", 1)[0]
+
+
+def _parse_kalshi_time(raw) -> datetime | None:
+    """Parsea un timestamp ISO8601 que viene de la API de Kalshi (open_time,
+    close_time, etc), con o sin sufijo 'Z'. None si no se pudo parsear."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def game_recently_traded(cur, ticker: str) -> bool:
@@ -985,15 +1027,6 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         print(f"[info] entro en {ticker} a {entry}c x{filled}")
 
 
-def _parse_close_time(raw) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
     """Apuesta de rescate en futbol americano: un equipo cotiza carisimo
     (mercado lo da casi por ganador) y el rival cotiza baratisimo, con el
@@ -1044,7 +1077,7 @@ def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_clien
             if yes_ask_cents <= 0 or yes_ask_cents > RESCUE_CHEAP_MAX_CENTS:
                 continue
 
-            close_dt = _parse_close_time(market.get("close_time"))
+            close_dt = _parse_kalshi_time(market.get("close_time"))
             if close_dt is None:
                 continue
             minutes_to_close = (close_dt - now).total_seconds() / 60.0
@@ -1141,7 +1174,17 @@ def main() -> None:
                 due = entries_scan_due(cur)
                 conn.commit()
             if not due:
-                print(f"[info] todavia no pasan los {ENTRY_SCAN_INTERVAL_MINUTES} min desde la ultima busqueda de entradas nuevas; esta corrida solo vigilo las posiciones abiertas")
+                # Aunque no haya pasado la hora completa, si un partido acaba
+                # de arrancar se adelanta la busqueda igual -- ahi suele haber
+                # mas oportunidades de precio que esperando a que pase la hora.
+                if has_new_game(public_client, series_tickers):
+                    print(f"[info] partido nuevo detectado (abrio hace <= {NEW_GAME_WINDOW_MINUTES} min); se adelanta la busqueda de entradas sin esperar a que pase la hora")
+                    with conn.cursor() as cur:
+                        mark_entry_scan_done(cur)
+                        look_for_entries(conn, cur, public_client, trading_client, series_tickers)
+                        conn.commit()
+                else:
+                    print(f"[info] todavia no pasan los {ENTRY_SCAN_INTERVAL_MINUTES} min desde la ultima busqueda de entradas nuevas; esta corrida solo vigilo las posiciones abiertas")
             else:
                 with conn.cursor() as cur:
                     look_for_entries(conn, cur, public_client, trading_client, series_tickers)
