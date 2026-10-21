@@ -35,6 +35,11 @@ MAX_ENTRY_CENTS = int(os.environ.get("STRAT_MAX_ENTRY_CENTS", "45"))
 TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_TAKE_PROFIT_CENTS", "15"))
 STOP_LOSS_CENTS = int(os.environ.get("STRAT_STOP_LOSS_CENTS", "10"))
 FIXED_CONTRACTS = int(os.environ.get("STRAT_FIXED_CONTRACTS", "5"))
+# Tamano de entrada reducido que se usa automaticamente mientras la perdida
+# realizada de las ultimas STRAT_LOSS_WINDOW_HOURS siga tocando el limite
+# diario (ver mas abajo, en look_for_entries). No frena las compras, solo
+# las achica, y vuelve sola a FIXED_CONTRACTS cuando esa ventana se enfria.
+REDUCED_CONTRACTS = int(os.environ.get("STRAT_REDUCED_CONTRACTS", "5"))
 MAX_OPEN_POSITIONS = int(os.environ.get("STRAT_MAX_OPEN_POSITIONS", "3"))
 DAILY_LOSS_LIMIT_CENTS = int(os.environ.get("STRAT_DAILY_LOSS_LIMIT_CENTS", "500"))  # $5.00 default
 # Tope de perdida en ventana movil (antes era por dia UTC y se reiniciaba a
@@ -795,9 +800,17 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     if hourly_cap_reached(cur):
         print(f"[info] ya hubo {MAX_ENTRIES_PER_HOUR} entrada(s) en la ultima hora; no se abren mas hasta que pase")
         return
+    # Antes esto cortaba TODAS las entradas nuevas hasta que la ventana de
+    # perdida se enfriara. Ahora, en vez de parar, se sigue comprando pero
+    # con tamano reducido (REDUCED_CONTRACTS) -- asi se consume mas lento el
+    # limite y se sigue operando. En cuanto recent_realized_pnl_cents() deje
+    # de estar por debajo del limite (las perdidas viejas salen solas de la
+    # ventana movil de LOSS_WINDOW_HOURS), esto vuelve a FIXED_CONTRACTS sin
+    # que haga falta ningun temporizador aparte.
+    contracts_this_run = FIXED_CONTRACTS
     if recent_realized_pnl_cents(cur) <= -DAILY_LOSS_LIMIT_CENTS:
-        print(f"[info] limite de perdida alcanzado en las ultimas {LOSS_WINDOW_HOURS} h, no se abren nuevas posiciones")
-        return
+        contracts_this_run = REDUCED_CONTRACTS
+        print(f"[info] limite de perdida alcanzado en las ultimas {LOSS_WINDOW_HOURS} h; se sigue comprando pero con tamano reducido ({REDUCED_CONTRACTS} contratos) hasta que esa ventana se enfrie")
 
     def iter_markets():
         for series in series_tickers:
@@ -853,7 +866,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         pocket = market.get("exchange_index")
         if pockets is not None and pocket is not None:
             pocket = int(pocket)
-            cost = FIXED_CONTRACTS * yes_ask_cents / 100.0
+            cost = contracts_this_run * yes_ask_cents / 100.0
             if pockets.get(pocket, 0.0) < cost + 0.05:
                 moved = POCKET_AUTOFUND and autofund_pocket(trading_client, pockets, pocket, cost + 0.05)
                 if moved:
@@ -880,7 +893,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
 
         try:
             resp = trading_client.create_order(
-                ticker=ticker, side="yes", action="buy", count=FIXED_CONTRACTS, price_cents=yes_ask_cents,
+                ticker=ticker, side="yes", action="buy", count=contracts_this_run, price_cents=yes_ask_cents,
                 time_in_force="immediate_or_cancel",  # compra lo que haya a ese precio; nada queda colgado
             )
         except Exception as exc:
@@ -889,7 +902,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
                     bal = trading_client.get_balance()
                 except Exception as bexc:
                     bal = f"no se pudo leer ({bexc})"
-                print(f"[info] saldo insuficiente en Kalshi al comprar {ticker} ({FIXED_CONTRACTS} x {yes_ask_cents}c); no se buscan mas compras en esta corrida")
+                print(f"[info] saldo insuficiente en Kalshi al comprar {ticker} ({contracts_this_run} x {yes_ask_cents}c); no se buscan mas compras en esta corrida")
                 print(f"[info] detalle del error: {str(exc)[:300]}")
                 print(f"[info] balance segun la API: {bal}")
                 if insufficient_fails == 0:
@@ -914,7 +927,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         if filled <= 0:
             print(f"[info] {ticker}: no habia vendedores a {yes_ask_cents}c; no se compro nada")
             continue
-        filled = min(filled, FIXED_CONTRACTS)
+        filled = min(filled, contracts_this_run)
         if pockets is not None and pocket is not None:
             pockets[int(pocket)] = pockets.get(int(pocket), 0.0) - filled * (avg_cents if avg_cents is not None else yes_ask_cents) / 100.0
         entry = avg_cents if avg_cents is not None else yes_ask_cents
