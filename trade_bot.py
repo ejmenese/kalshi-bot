@@ -54,6 +54,24 @@ LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
 MAX_ENTRIES_PER_GAME = int(os.environ.get("STRAT_MAX_ENTRIES_PER_GAME", "3"))
 # Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
 MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
+
+# --- Apuesta de rescate (comeback) en futbol americano -----------------
+# Regla aparte del filtro normal de entradas (que va de MIN_ENTRY_CENTS a
+# MAX_ENTRY_CENTS). Busca partidos de NFL/NCAAF donde un equipo ya cotiza
+# carisimo (>= RESCUE_EXPENSIVE_MIN_CENTS, "practicamente decidido") y el
+# rival cotiza baratisimo (<= RESCUE_CHEAP_MAX_CENTS) con el cierre del
+# mercado proximo (dentro de RESCUE_CLOSE_WINDOW_MINUTES) -- la foto que
+# describe un equipo perdiendo por poco con poco tiempo en el reloj. No hay
+# reloj de juego en vivo (el bot revisa cada 15 min, no segundo a segundo);
+# el precio + la cercania del cierre son el sustituto. Compra el lado barato
+# por un monto fijo en dolares (RESCUE_DOLLARS), no por cantidad de
+# contratos fijos como el resto de la estrategia.
+RESCUE_ENABLED = os.environ.get("STRAT_RESCUE_ENABLED", "1") == "1"
+RESCUE_SERIES = ["KXNFLGAME", "KXNCAAFGAME"]
+RESCUE_CHEAP_MAX_CENTS = int(os.environ.get("STRAT_RESCUE_CHEAP_MAX_CENTS", "10"))
+RESCUE_EXPENSIVE_MIN_CENTS = int(os.environ.get("STRAT_RESCUE_EXPENSIVE_MIN_CENTS", "90"))
+RESCUE_CLOSE_WINDOW_MINUTES = int(os.environ.get("STRAT_RESCUE_CLOSE_WINDOW_MINUTES", "30"))
+RESCUE_DOLLARS = float(os.environ.get("STRAT_RESCUE_DOLLARS", "2"))
 # El cron sigue corriendo cada 15 min (Render) para vigilar y proteger las
 # posiciones abiertas, pero la BUSQUEDA de entradas nuevas solo se hace una
 # vez cada STRAT_ENTRY_SCAN_MINUTES (60 por defecto = "cada hora, 24/7").
@@ -967,6 +985,102 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         print(f"[info] entro en {ticker} a {entry}c x{filled}")
 
 
+def _parse_close_time(raw) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
+    """Apuesta de rescate en futbol americano: un equipo cotiza carisimo
+    (mercado lo da casi por ganador) y el rival cotiza baratisimo, con el
+    cierre del mercado cerca -- la foto de un equipo perdiendo por poco con
+    poco tiempo en el reloj. Compra el lado barato por RESCUE_DOLLARS fijos.
+    No depende de entries_scan_due(): se revisa en CADA corrida (cada 15 min)
+    porque la ventana real puede ser de minutos."""
+    if not RESCUE_ENABLED:
+        return
+
+    busy = kalshi_busy_tickers(trading_client)
+    if busy is None:
+        return
+
+    now = datetime.now(timezone.utc)
+    events: dict[str, list[dict]] = {}
+    for series in RESCUE_SERIES:
+        if not series_allowed(series):
+            continue
+        try:
+            for m in public_client.get_open_markets_for_series(series):
+                events.setdefault(event_of(m.get("ticker", "")), []).append(m)
+        except Exception as exc:
+            print(f"[warn] rescate: no se pudo leer la serie {series}: {exc}")
+
+    for event, markets in events.items():
+        if len(markets) < 2:
+            continue
+        if any(event_of(b) == event for b in busy):
+            continue  # ya hay una posicion abierta en este partido
+
+        expensive_ok = any(
+            (m.get("yes_ask_dollars") is not None and round(float(m["yes_ask_dollars"]) * 100) >= RESCUE_EXPENSIVE_MIN_CENTS)
+            for m in markets
+        )
+        if not expensive_ok:
+            continue
+
+        for market in markets:
+            ticker = market.get("ticker")
+            if not ticker or ticker in busy or already_holds(cur, ticker) or game_recently_traded(cur, ticker):
+                continue
+
+            yes_ask = market.get("yes_ask_dollars")
+            if yes_ask is None:
+                continue
+            yes_ask_cents = round(float(yes_ask) * 100)
+            if yes_ask_cents <= 0 or yes_ask_cents > RESCUE_CHEAP_MAX_CENTS:
+                continue
+
+            close_dt = _parse_close_time(market.get("close_time"))
+            if close_dt is None:
+                continue
+            minutes_to_close = (close_dt - now).total_seconds() / 60.0
+            if not (0 <= minutes_to_close <= RESCUE_CLOSE_WINDOW_MINUTES):
+                continue
+
+            count = int((RESCUE_DOLLARS * 100) // yes_ask_cents)
+            if count < 1:
+                continue
+
+            try:
+                resp = trading_client.create_order(
+                    ticker=ticker, side="yes", action="buy", count=count, price_cents=yes_ask_cents,
+                    time_in_force="immediate_or_cancel",
+                )
+            except Exception as exc:
+                print(f"[warn] rescate: no se pudo comprar {ticker}: {exc}")
+                continue
+
+            filled, avg_cents = parse_fill(resp)
+            if filled <= 0:
+                print(f"[info] rescate: {ticker}: no habia vendedores a {yes_ask_cents}c; no se compro nada")
+                continue
+            filled = min(filled, count)
+            entry = avg_cents if avg_cents is not None else yes_ask_cents
+            cur.execute(
+                """INSERT INTO kalshi_trades (ticker, side, count, entry_price, status, env)
+                   VALUES (%s, 'yes', %s, %s, 'open', %s)""",
+                (ticker, filled, entry, BOT_ENV),
+            )
+            conn.commit()
+            busy.add(ticker)
+            print(f"[info] RESCATE: entro en {ticker} a {entry}c x{filled} (rival cotizaba >= {RESCUE_EXPENSIVE_MIN_CENTS}c, cierra en {minutes_to_close:.1f} min)")
+            break  # un solo lado por partido en esta corrida
+
+
 def main() -> None:
     print(f"[info] ambiente: {BOT_ENV} (KALSHI_ENV={os.environ.get('KALSHI_ENV', 'demo')!r})")
     all_series = resolve_series(os.environ.get("KALSHI_SERIES", "ALL_SPORTS"))
@@ -1016,6 +1130,13 @@ def main() -> None:
         if ENTRIES_PAUSED:
             print("[info] STRAT_ENTRIES_PAUSED activo: no se abren posiciones nuevas (las abiertas siguen vigiladas)")
         else:
+            # La apuesta de rescate se revisa SIEMPRE (cada 15 min), no solo
+            # cuando toca la busqueda horaria normal -- la ventana de "equipo
+            # perdiendo con poco tiempo" puede durar pocos minutos.
+            with conn.cursor() as cur:
+                look_for_comeback_bets(conn, cur, public_client, trading_client)
+                conn.commit()
+
             with conn.cursor() as cur:
                 due = entries_scan_due(cur)
                 conn.commit()
