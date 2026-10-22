@@ -107,6 +107,16 @@ POCKET_AUTOFUND = os.environ.get("STRAT_POCKET_AUTOFUND", "1").strip().lower() i
 PROTECT_MANUAL = os.environ.get("STRAT_PROTECT_MANUAL", "1").strip().lower() in ("1", "true", "yes", "si")
 MANUAL_STOP_CENTS = int(os.environ.get("STRAT_MANUAL_STOP_CENTS", str(STOP_LOSS_CENTS)))
 MANUAL_TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_MANUAL_TAKE_PROFIT_CENTS", str(TAKE_PROFIT_CENTS)))
+# Lista puntual de posiciones manuales a "montar hasta el final": se venden
+# solo cuando el precio llega casi al maximo (RIDE_SELL_CENTS, cerca del
+# pago completo de $1), sin stop-loss ni take-profit normal. Funciona
+# INDEPENDIENTE de STRAT_PROTECT_MANUAL (sigue activo aunque la proteccion
+# general este apagada) -- es para una apuesta puntual que el usuario pide
+# "cobrar" cuando esta practicamente ganada, no para vigilancia general.
+RIDE_TO_WIN_TICKERS = [
+    t.strip() for t in os.environ.get("STRAT_MANUAL_RIDE_TICKERS", "").split(",") if t.strip()
+]
+RIDE_TO_WIN_SELL_CENTS = int(os.environ.get("STRAT_MANUAL_RIDE_SELL_CENTS", "99"))
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -850,6 +860,61 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
             print(f"[info] posicion manual {ticker} cerrada por ganancia: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
 
 
+def sell_ride_to_win_positions(public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
+    """Vende las posiciones puntuales de RIDE_TO_WIN_TICKERS en cuanto el bid
+    llega a RIDE_TO_WIN_SELL_CENTS (cerca del pago maximo de $1). No aplica
+    stop-loss ni el take-profit normal -- es solo para cobrar una apuesta que
+    el usuario pidio explicitamente, aunque STRAT_PROTECT_MANUAL este en 0."""
+    if not RIDE_TO_WIN_TICKERS:
+        return
+    try:
+        data = trading_client._get("/portfolio/positions", {"limit": 1000})
+    except Exception as exc:
+        print(f"[warn] no se pudieron leer posiciones para RIDE_TO_WIN: {exc}")
+        return
+    positions_by_ticker = {p.get("ticker"): p for p in (data.get("market_positions") or [])}
+    for ticker in RIDE_TO_WIN_TICKERS:
+        p = positions_by_ticker.get(ticker)
+        if p is None:
+            continue
+        try:
+            qty = float(p.get("position_fp", p.get("position", 0)) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty < 1:
+            continue
+        try:
+            market = public_client.get_market(ticker)
+            market = market.get("market", market) if isinstance(market, dict) else {}
+        except Exception as exc:
+            print(f"[warn] RIDE_TO_WIN {ticker}: no se pudo leer el precio ({str(exc)[:100]})")
+            continue
+        bid_c = _dollars_to_cents(market.get("yes_bid_dollars"))
+        if bid_c is None:
+            continue
+        bid_c = round(bid_c)
+        print(f"[info] vigilando (cobrar al llegar al maximo) {ticker}: {qty:g} contratos, bid {bid_c}c, objetivo {RIDE_TO_WIN_SELL_CENTS}c")
+        if bid_c < RIDE_TO_WIN_SELL_CENTS:
+            continue
+        count = int(qty)
+        if count <= 0:
+            continue
+        sell_price = max(1, bid_c - SL_SLIPPAGE_CENTS)
+        try:
+            resp = trading_client.create_order(
+                ticker=ticker, side="yes", action="sell", count=count, price_cents=sell_price, reduce_only=True,
+            )
+        except Exception as exc:
+            print(f"[warn] no se pudo cobrar {ticker}: {exc}")
+            continue
+        filled, avg_exit = parse_fill(resp)
+        if filled <= 0:
+            print(f"[info] cobro de {ticker} no se lleno; se reintenta")
+            continue
+        exit_c = avg_exit if avg_exit is not None else sell_price
+        print(f"[info] {ticker} cobrada al maximo: {filled} a {exit_c}c")
+
+
 def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient, series_tickers: list[str]) -> None:
     busy = kalshi_busy_tickers(trading_client)
     if busy is None:
@@ -1168,6 +1233,8 @@ def main() -> None:
 
         with conn.cursor() as cur:
             protect_manual_positions(cur, public_client, trading_client)
+
+        sell_ride_to_win_positions(public_client, trading_client)
 
         with conn.cursor() as cur:
             backfill_settled_pnl(cur, public_client)
