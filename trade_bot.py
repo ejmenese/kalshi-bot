@@ -101,10 +101,12 @@ AUTO_REBALANCE = os.environ.get("STRAT_AUTO_REBALANCE", "1").strip().lower() in 
 # mercado y sigue con el resto.
 POCKET_AUTOFUND = os.environ.get("STRAT_POCKET_AUTOFUND", "1").strip().lower() in ("1", "true", "yes", "si")
 # Vigila las posiciones que pones a mano en Kalshi (las que no abrio el bot) y
-# las cierra si caen MANUAL_STOP_CENTS por debajo de su costo promedio.
-# Nunca las cierra por ganancia.
+# las cierra en dos casos: si caen MANUAL_STOP_CENTS por debajo de su costo
+# promedio (proteccion/stop-loss), o si suben MANUAL_TAKE_PROFIT_CENTS por
+# encima (toma de ganancia automatica).
 PROTECT_MANUAL = os.environ.get("STRAT_PROTECT_MANUAL", "1").strip().lower() in ("1", "true", "yes", "si")
 MANUAL_STOP_CENTS = int(os.environ.get("STRAT_MANUAL_STOP_CENTS", str(STOP_LOSS_CENTS)))
+MANUAL_TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_MANUAL_TAKE_PROFIT_CENTS", str(TAKE_PROFIT_CENTS)))
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -765,8 +767,9 @@ def _dollars_to_cents(value) -> float | None:
 
 def protect_manual_positions(cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
     """Vigila las posiciones YES de tu cuenta que el bot no abrio (las que
-    pones a mano) y las vende si el precio cae MANUAL_STOP_CENTS por debajo de
-    su costo promedio. No toma ganancias."""
+    pones a mano) y las vende en dos casos: si el precio cae MANUAL_STOP_CENTS
+    por debajo de su costo promedio (proteccion), o si sube
+    MANUAL_TAKE_PROFIT_CENTS por encima (toma de ganancia automatica)."""
     if not PROTECT_MANUAL:
         return
     # Se excluyen las posiciones abiertas del bot y tambien las que el bot
@@ -816,7 +819,13 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
             continue
         bid_c = round(bid_c)
         print(f"[info] vigilando posicion manual {ticker}: {qty:g} contratos, costo medio {avg_cost:.0f}c, bid {bid_c}c")
-        if bid_c <= 0 or bid_c > avg_cost - MANUAL_STOP_CENTS:
+        if bid_c <= 0:
+            continue
+        if bid_c <= avg_cost - MANUAL_STOP_CENTS:
+            reason = "perdida"
+        elif bid_c >= avg_cost + MANUAL_TAKE_PROFIT_CENTS:
+            reason = "ganancia"
+        else:
             continue
         sell_price = max(1, bid_c - SL_SLIPPAGE_CENTS)
         count = int(qty)
@@ -834,7 +843,11 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
             print(f"[info] cierre de la posicion manual {ticker} no se lleno; se reintenta")
             continue
         exit_c = avg_exit if avg_exit is not None else sell_price
-        print(f"[info] posicion manual {ticker} cerrada por proteccion: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {round((exit_c - avg_cost) * filled)}c)")
+        pnl_aprox = round((exit_c - avg_cost) * filled)
+        if reason == "perdida":
+            print(f"[info] posicion manual {ticker} cerrada por proteccion: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
+        else:
+            print(f"[info] posicion manual {ticker} cerrada por ganancia: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
 
 
 def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient, series_tickers: list[str]) -> None:
