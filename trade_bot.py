@@ -718,7 +718,14 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
             continue
         current_bid_cents = round(float(yes_bid_dollars) * 100)
 
-        hit_take_profit = current_bid_cents >= entry_price + TAKE_PROFIT_CENTS
+        # Objetivo de ganancia: el que sea MAYOR entre el take-profit fijo
+        # (entry_price + TAKE_PROFIT_CENTS) y el objetivo en % (PCT_TARGET_PERCENT,
+        # el mismo que se usa para las posiciones manuales). Asi nunca se achica
+        # la ganancia que ya funcionaba en la banda tipica del bot (20-45c) --
+        # el % solo entra a jugar (y extiende el objetivo) en entradas mas caras.
+        pct_target_price = entry_price * (1 + PCT_TARGET_PERCENT / 100)
+        take_profit_target = max(entry_price + TAKE_PROFIT_CENTS, pct_target_price)
+        hit_take_profit = current_bid_cents >= take_profit_target
         hit_stop_loss = current_bid_cents <= entry_price - STOP_LOSS_CENTS
 
         forced = FORCE_CLOSE_ALL or ticker in FORCE_CLOSE
