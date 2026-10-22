@@ -117,6 +117,15 @@ RIDE_TO_WIN_TICKERS = [
     t.strip() for t in os.environ.get("STRAT_MANUAL_RIDE_TICKERS", "").split(",") if t.strip()
 ]
 RIDE_TO_WIN_SELL_CENTS = int(os.environ.get("STRAT_MANUAL_RIDE_SELL_CENTS", "99"))
+# Igual que RIDE_TO_WIN pero con objetivo en PORCENTAJE de ganancia sobre el
+# costo promedio, en vez de un precio fijo cercano al maximo. Pensado para el
+# flujo "yo compro a mano para que no se me escape el precio, el bot vende
+# solo cuando llegue a tal % de ganancia". Tambien independiente de
+# STRAT_PROTECT_MANUAL.
+PCT_TARGET_TICKERS = [
+    t.strip() for t in os.environ.get("STRAT_MANUAL_PCT_TICKERS", "").split(",") if t.strip()
+]
+PCT_TARGET_PERCENT = int(os.environ.get("STRAT_MANUAL_PCT_TARGET", "50"))
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -915,6 +924,70 @@ def sell_ride_to_win_positions(public_client: KalshiClient, trading_client: Kals
         print(f"[info] {ticker} cobrada al maximo: {filled} a {exit_c}c")
 
 
+def sell_pct_target_positions(public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
+    """Vende las posiciones puntuales de PCT_TARGET_TICKERS en cuanto el bid
+    llegue a PCT_TARGET_PERCENT% de ganancia sobre el costo promedio (ej. 50%
+    = vender cuando el precio sea 1.5x lo que se pago). Pensado para "yo
+    compro a mano al precio que quiero, el bot vende solo al % que yo diga".
+    Sin stop-loss -- si se quiere proteccion ademas, se usa STRAT_PROTECT_MANUAL
+    por separado. Independiente de ese flag."""
+    if not PCT_TARGET_TICKERS:
+        return
+    try:
+        data = trading_client._get("/portfolio/positions", {"limit": 1000})
+    except Exception as exc:
+        print(f"[warn] no se pudieron leer posiciones para PCT_TARGET: {exc}")
+        return
+    positions_by_ticker = {p.get("ticker"): p for p in (data.get("market_positions") or [])}
+    for ticker in PCT_TARGET_TICKERS:
+        p = positions_by_ticker.get(ticker)
+        if p is None:
+            continue
+        try:
+            qty = float(p.get("position_fp", p.get("position", 0)) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty < 1:
+            continue
+        exposure_c = _dollars_to_cents(p.get("market_exposure_dollars"))
+        if exposure_c is None or qty <= 0:
+            print(f"[info] PCT_TARGET {ticker}: sin costo en la API, no se puede vigilar")
+            continue
+        avg_cost = exposure_c / qty
+        target_c = min(99, avg_cost * (1 + PCT_TARGET_PERCENT / 100))
+        try:
+            market = public_client.get_market(ticker)
+            market = market.get("market", market) if isinstance(market, dict) else {}
+        except Exception as exc:
+            print(f"[warn] PCT_TARGET {ticker}: no se pudo leer el precio ({str(exc)[:100]})")
+            continue
+        bid_c = _dollars_to_cents(market.get("yes_bid_dollars"))
+        if bid_c is None:
+            continue
+        bid_c = round(bid_c)
+        print(f"[info] vigilando (objetivo {PCT_TARGET_PERCENT}% ganancia) {ticker}: {qty:g} contratos, costo medio {avg_cost:.0f}c, bid {bid_c}c, objetivo {target_c:.0f}c")
+        if bid_c < target_c:
+            continue
+        count = int(qty)
+        if count <= 0:
+            continue
+        sell_price = max(1, bid_c - SL_SLIPPAGE_CENTS)
+        try:
+            resp = trading_client.create_order(
+                ticker=ticker, side="yes", action="sell", count=count, price_cents=sell_price, reduce_only=True,
+            )
+        except Exception as exc:
+            print(f"[warn] no se pudo cobrar {ticker} (objetivo %): {exc}")
+            continue
+        filled, avg_exit = parse_fill(resp)
+        if filled <= 0:
+            print(f"[info] cobro de {ticker} (objetivo %) no se lleno; se reintenta")
+            continue
+        exit_c = avg_exit if avg_exit is not None else sell_price
+        pnl_aprox = round((exit_c - avg_cost) * filled)
+        print(f"[info] {ticker} cobrada al {PCT_TARGET_PERCENT}% de ganancia: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
+
+
 def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: KalshiTradingClient, series_tickers: list[str]) -> None:
     busy = kalshi_busy_tickers(trading_client)
     if busy is None:
@@ -1235,6 +1308,7 @@ def main() -> None:
             protect_manual_positions(cur, public_client, trading_client)
 
         sell_ride_to_win_positions(public_client, trading_client)
+        sell_pct_target_positions(public_client, trading_client)
 
         with conn.cursor() as cur:
             backfill_settled_pnl(cur, public_client)
