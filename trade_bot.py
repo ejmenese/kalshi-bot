@@ -126,6 +126,11 @@ PCT_TARGET_TICKERS = [
     t.strip() for t in os.environ.get("STRAT_MANUAL_PCT_TICKERS", "").split(",") if t.strip()
 ]
 PCT_TARGET_PERCENT = int(os.environ.get("STRAT_MANUAL_PCT_TARGET", "50"))
+# Con STRAT_MANUAL_PCT_AUTO=1, en vez de vigilar solo los tickers de la lista
+# anterior, se aplica el objetivo de % de ganancia a TODA posicion manual
+# nueva automaticamente (no hace falta avisar el ticker). Sigue sin
+# stop-loss y sigue independiente de STRAT_PROTECT_MANUAL.
+PCT_TARGET_AUTO = os.environ.get("STRAT_MANUAL_PCT_AUTO", "0").strip().lower() in ("1", "true", "yes", "si")
 # Con STRAT_ENTRIES_PAUSED=1 el bot NO abre posiciones nuevas, pero sigue
 # vigilando y cerrando las que ya tiene (stop-loss / take-profit).
 ENTRIES_PAUSED = os.environ.get("STRAT_ENTRIES_PAUSED", "").strip().lower() in ("1", "true", "yes", "si")
@@ -924,14 +929,19 @@ def sell_ride_to_win_positions(public_client: KalshiClient, trading_client: Kals
         print(f"[info] {ticker} cobrada al maximo: {filled} a {exit_c}c")
 
 
-def sell_pct_target_positions(public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
-    """Vende las posiciones puntuales de PCT_TARGET_TICKERS en cuanto el bid
-    llegue a PCT_TARGET_PERCENT% de ganancia sobre el costo promedio (ej. 50%
-    = vender cuando el precio sea 1.5x lo que se pago). Pensado para "yo
-    compro a mano al precio que quiero, el bot vende solo al % que yo diga".
+def sell_pct_target_positions(cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
+    """Vende posiciones manuales en cuanto el bid llegue a PCT_TARGET_PERCENT%
+    de ganancia sobre el costo promedio (ej. 50% = vender cuando el precio
+    sea 1.5x lo que se pago). Pensado para "yo compro a mano al precio que
+    quiero, el bot vende solo al % que yo diga".
+
+    Con PCT_TARGET_AUTO=0 (default) solo vigila los tickers puntuales de
+    PCT_TARGET_TICKERS. Con PCT_TARGET_AUTO=1 vigila TODA posicion manual
+    nueva automaticamente, sin que haga falta avisar el ticker.
+
     Sin stop-loss -- si se quiere proteccion ademas, se usa STRAT_PROTECT_MANUAL
     por separado. Independiente de ese flag."""
-    if not PCT_TARGET_TICKERS:
+    if not PCT_TARGET_AUTO and not PCT_TARGET_TICKERS:
         return
     try:
         data = trading_client._get("/portfolio/positions", {"limit": 1000})
@@ -939,7 +949,19 @@ def sell_pct_target_positions(public_client: KalshiClient, trading_client: Kalsh
         print(f"[warn] no se pudieron leer posiciones para PCT_TARGET: {exc}")
         return
     positions_by_ticker = {p.get("ticker"): p for p in (data.get("market_positions") or [])}
-    for ticker in PCT_TARGET_TICKERS:
+    if PCT_TARGET_AUTO:
+        cur.execute(
+            """SELECT DISTINCT ticker FROM kalshi_trades
+               WHERE env = %s AND (status = 'open'
+                     OR opened_at >= now() - interval '30 minutes'
+                     OR closed_at >= now() - interval '30 minutes')""",
+            (BOT_ENV,),
+        )
+        bot_open = {r[0] for r in cur.fetchall()}
+        target_tickers = [t for t in positions_by_ticker if t not in bot_open]
+    else:
+        target_tickers = PCT_TARGET_TICKERS
+    for ticker in target_tickers:
         p = positions_by_ticker.get(ticker)
         if p is None:
             continue
@@ -1308,7 +1330,8 @@ def main() -> None:
             protect_manual_positions(cur, public_client, trading_client)
 
         sell_ride_to_win_positions(public_client, trading_client)
-        sell_pct_target_positions(public_client, trading_client)
+        with conn.cursor() as cur:
+            sell_pct_target_positions(cur, public_client, trading_client)
 
         with conn.cursor() as cur:
             backfill_settled_pnl(cur, public_client)
