@@ -32,6 +32,14 @@ MIN_VOLUME = int(os.environ.get("STRAT_MIN_VOLUME", "50"))
 MAX_SPREAD_CENTS = int(os.environ.get("STRAT_MAX_SPREAD_CENTS", "3"))
 MIN_ENTRY_CENTS = int(os.environ.get("STRAT_MIN_ENTRY_CENTS", "20"))
 MAX_ENTRY_CENTS = int(os.environ.get("STRAT_MAX_ENTRY_CENTS", "45"))
+# Tope de precio mas alto que se usa SOLO para re-entradas en un partido que
+# ya tuvo alguna operacion antes (ganada o perdida). La idea: si el primer
+# lado comprado (barato, 20-45c) cerro en perdida, es porque el precio se le
+# fue en contra -- y el lado rival de ese mismo partido subio de precio en
+# espejo (ya va ganando). El tope normal de 45c no deja comprar ese lado
+# porque ya no es "barato"; este tope mas alto si lo permite, para poder
+# "montarse" al que va ganando en vez de quedar fuera del partido.
+REENTRY_MAX_ENTRY_CENTS = int(os.environ.get("STRAT_REENTRY_MAX_ENTRY_CENTS", "85"))
 TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_TAKE_PROFIT_CENTS", "15"))
 STOP_LOSS_CENTS = int(os.environ.get("STRAT_STOP_LOSS_CENTS", "10"))
 FIXED_CONTRACTS = int(os.environ.get("STRAT_FIXED_CONTRACTS", "5"))
@@ -554,15 +562,17 @@ def _parse_kalshi_time(raw) -> datetime | None:
 
 
 def game_recently_traded(cur, ticker: str) -> bool:
-    """True si ya no se puede entrar mas en este partido, por cualquiera de
-    estos dos motivos:
-    1. Se alcanzo MAX_ENTRIES_PER_GAME contando TODAS las operaciones
-       (abiertas o ya cerradas) en cualquier mercado de ese partido.
-    2. La ULTIMA operacion cerrada de ese partido no cerro en ganancia
-       (pnl_cents <= 0). La cadena de "montar y liquidar" solo sigue
-       mientras cada paso va ganando; si una cierra en perdida o en cero,
-       no se monta la siguiente en ese mismo partido (tenis y futbol
-       americano por igual).
+    """True si ya no se puede entrar mas en este partido: se alcanzo
+    MAX_ENTRIES_PER_GAME contando TODAS las operaciones (abiertas o ya
+    cerradas) en cualquier mercado de ese partido.
+
+    Ya NO bloquea solo porque la ultima operacion del partido haya cerrado
+    en perdida -- el usuario pidio explicitamente poder seguir jugando el
+    mismo partido tras una perdida, montandose al lado que en ese momento
+    va ganando (ver event_has_prior_trade / ticker_closed_in_loss, que se
+    usan en look_for_entries para elegir ESE lado y no repetir el que ya
+    perdio).
+
     La entrada simultanea a los dos lados (o una segunda mientras la
     primera sigue abierta) la bloquea por separado el chequeo de 'busy'
     por evento en look_for_entries."""
@@ -572,23 +582,36 @@ def game_recently_traded(cur, ticker: str) -> bool:
         "SELECT COUNT(*) FROM kalshi_trades WHERE ticker LIKE %s AND env = %s",
         (event_pattern, BOT_ENV),
     )
-    if cur.fetchone()[0] >= MAX_ENTRIES_PER_GAME:
-        return True
+    return cur.fetchone()[0] >= MAX_ENTRIES_PER_GAME
 
+
+def event_has_prior_trade(cur, ticker: str) -> bool:
+    """True si este partido (cualquier lado) ya tuvo alguna operacion antes,
+    abierta o cerrada. Senal de que es una RE-entrada, no la primera vez que
+    se entra a este partido -- habilita el tope de precio mas alto
+    (REENTRY_MAX_ENTRY_CENTS) para poder comprar al lado que ya va ganando
+    aunque su precio haya subido por encima del tope normal."""
+    event_pattern = event_of(ticker) + "-%"
     cur.execute(
-        """
-        SELECT pnl_cents FROM kalshi_trades
-        WHERE ticker LIKE %s AND env = %s AND status != 'open' AND pnl_cents IS NOT NULL
-        ORDER BY closed_at DESC
-        LIMIT 1
-        """,
+        "SELECT 1 FROM kalshi_trades WHERE ticker LIKE %s AND env = %s LIMIT 1",
         (event_pattern, BOT_ENV),
     )
-    row = cur.fetchone()
-    if row is not None and row[0] <= 0:
-        return True
+    return cur.fetchone() is not None
 
-    return False
+
+def ticker_closed_in_loss(cur, ticker: str) -> bool:
+    """True si ESTE lado exacto del partido (no el partido entero) ya cerro
+    antes en perdida o en cero. Evita volver a comprar el mismo lado que ya
+    perdio cuando se relaja el tope de precio para re-entradas; el lado que
+    perdio es justo el que NO va ganando."""
+    cur.execute(
+        """SELECT 1 FROM kalshi_trades
+           WHERE ticker = %s AND env = %s AND status != 'open'
+                 AND pnl_cents IS NOT NULL AND pnl_cents <= 0
+           LIMIT 1""",
+        (ticker, BOT_ENV),
+    )
+    return cur.fetchone() is not None
 
 
 def entries_last_hour(cur) -> int:
@@ -1107,6 +1130,11 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         event = event_of(ticker)
         if any(event_of(b) == event for b in busy) or game_recently_traded(cur, ticker):
             continue
+        # Re-entrada a un partido que ya se jugo antes: no repetir el mismo
+        # lado que ya perdio (ese no es "el que va ganando").
+        is_reentry = event_has_prior_trade(cur, ticker)
+        if is_reentry and ticker_closed_in_loss(cur, ticker):
+            continue
 
         volume_raw = market.get("volume_fp") or 0
         try:
@@ -1126,7 +1154,12 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
             continue
         if spread > MAX_SPREAD_CENTS or spread < 0:
             continue
-        if not (MIN_ENTRY_CENTS <= yes_ask_cents <= MAX_ENTRY_CENTS):
+        # En re-entrada se usa un tope de precio mas alto: el lado que va
+        # ganando ya no es "barato" (subio por encima de MAX_ENTRY_CENTS en
+        # espejo a que el otro lado cayo), pero sigue siendo el que interesa
+        # comprar.
+        max_entry_for_this = REENTRY_MAX_ENTRY_CENTS if is_reentry else MAX_ENTRY_CENTS
+        if not (MIN_ENTRY_CENTS <= yes_ask_cents <= max_entry_for_this):
             continue
 
         pocket = market.get("exchange_index")
