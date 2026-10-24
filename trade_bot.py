@@ -1341,25 +1341,6 @@ def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_clien
         if not expensive_ok:
             continue
 
-        # El precio ya dice que el mercado casi decidio el ganador; ahora se
-        # exige que el marcador REAL (ESPN) este a RESCUE_MAX_SCORE_DIFF
-        # puntos o menos. Si no se puede confirmar (liga no mapeada, equipo
-        # no encontrado, API caida, o ESPN no lo marca "en vivo" ahora
-        # mismo), no se apuesta -- mejor perder la oportunidad que apostar
-        # a ciegas sobre el marcador.
-        series = event.split("-", 1)[0]
-        league_slug = RESCUE_ESPN_LEAGUE.get(series)
-        abbrs = sorted({m.get("ticker", "").rsplit("-", 1)[-1] for m in markets if m.get("ticker")})
-        diff = None
-        if league_slug and len(abbrs) == 2:
-            diff = live_score_diff(league_slug, abbrs[0], abbrs[1])
-        if diff is None:
-            print(f"[info] rescate: {event}: no se pudo confirmar el marcador real en ESPN; no se apuesta")
-            continue
-        if diff > RESCUE_MAX_SCORE_DIFF:
-            print(f"[info] rescate: {event}: marcador real a {diff} puntos de diferencia (> {RESCUE_MAX_SCORE_DIFF}); no se apuesta")
-            continue
-
         for market in markets:
             ticker = market.get("ticker")
             if not ticker or ticker in busy or already_holds(cur, ticker) or game_recently_traded(cur, ticker):
@@ -1377,6 +1358,26 @@ def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_clien
                 continue
             minutes_to_close = (close_dt - now).total_seconds() / 60.0
             if not (0 <= minutes_to_close <= RESCUE_CLOSE_WINDOW_MINUTES):
+                continue
+
+            # Recien aqui -- ya hay un lado carisimo, uno baratisimo, Y el
+            # mercado por cerrar -- vale la pena pagar el costo de consultar
+            # ESPN. Hacerlo antes (a nivel de partido, apenas se detecta un
+            # lado caro) disparaba la consulta para decenas de partidos
+            # futuros con un favorito marcado desde dias antes, sin ninguna
+            # urgencia real. Si no se puede confirmar el marcador real (liga
+            # no mapeada, equipo no encontrado, API caida, o ESPN no lo
+            # marca "en vivo" ahora mismo), no se apuesta -- mejor perder la
+            # oportunidad que apostar a ciegas sobre el marcador.
+            series = event.split("-", 1)[0]
+            league_slug = RESCUE_ESPN_LEAGUE.get(series)
+            abbrs = sorted({mm.get("ticker", "").rsplit("-", 1)[-1] for mm in markets if mm.get("ticker")})
+            diff = live_score_diff(league_slug, abbrs[0], abbrs[1]) if (league_slug and len(abbrs) == 2) else None
+            if diff is None:
+                print(f"[info] rescate: {event}: no se pudo confirmar el marcador real en ESPN; no se apuesta")
+                continue
+            if diff > RESCUE_MAX_SCORE_DIFF:
+                print(f"[info] rescate: {event}: marcador real a {diff} puntos de diferencia (> {RESCUE_MAX_SCORE_DIFF}); no se apuesta")
                 continue
 
             count = int((RESCUE_DOLLARS * 100) // yes_ask_cents)
