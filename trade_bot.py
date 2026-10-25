@@ -554,7 +554,9 @@ def has_new_game(public_client: KalshiClient, series_tickers: list[str]) -> bool
     que un partido acaba de arrancar. Se usa para adelantar la busqueda de
     entradas sin esperar a que pase la hora completa."""
     now = datetime.now(timezone.utc)
-    for series in series_tickers:
+    for i, series in enumerate(series_tickers):
+        if i > 0:
+            time.sleep(SERIES_PAUSE_SECONDS)
         try:
             for m in public_client.get_open_markets_for_series(series):
                 open_dt = _parse_kalshi_time(m.get("open_time"))
@@ -1402,9 +1404,13 @@ def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_clien
 
     now = datetime.now(timezone.utc)
     events: dict[str, list[dict]] = {}
+    first = True
     for series in RESCUE_SERIES:
         if not series_allowed(series):
             continue
+        if not first:
+            time.sleep(SERIES_PAUSE_SECONDS)
+        first = False
         try:
             for m in public_client.get_open_markets_for_series(series):
                 events.setdefault(event_of(m.get("ticker", "")), []).append(m)
