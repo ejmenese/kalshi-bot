@@ -76,7 +76,7 @@ MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
 # por un monto fijo en dolares (RESCUE_DOLLARS), no por cantidad de
 # contratos fijos como el resto de la estrategia.
 RESCUE_ENABLED = os.environ.get("STRAT_RESCUE_ENABLED", "1") == "1"
-RESCUE_SERIES = ["KXNFLGAME", "KXNCAAFGAME"]
+RESCUE_SERIES = ["KXNFLGAME", "KXNCAAFGAME", "KXMLBGAME"]
 RESCUE_CHEAP_MAX_CENTS = int(os.environ.get("STRAT_RESCUE_CHEAP_MAX_CENTS", "10"))
 RESCUE_EXPENSIVE_MIN_CENTS = int(os.environ.get("STRAT_RESCUE_EXPENSIVE_MIN_CENTS", "90"))
 RESCUE_CLOSE_WINDOW_MINUTES = int(os.environ.get("STRAT_RESCUE_CLOSE_WINDOW_MINUTES", "30"))
@@ -92,7 +92,13 @@ RESCUE_DOLLARS = float(os.environ.get("STRAT_RESCUE_DOLLARS", "2"))
 # "in progress" todavia segun ESPN), NO se apuesta -- mejor perder la
 # oportunidad que apostar a ciegas.
 RESCUE_MAX_SCORE_DIFF = int(os.environ.get("STRAT_RESCUE_MAX_SCORE_DIFF", "7"))
-RESCUE_ESPN_LEAGUE = {"KXNFLGAME": "nfl", "KXNCAAFGAME": "college-football"}
+# En beisbol una diferencia de 7 carreras ya es goleada (no "cerca"), asi que
+# se usa un tope aparte, mas chico, solo para KXMLBGAME.
+RESCUE_MAX_SCORE_DIFF_MLB = int(os.environ.get("STRAT_RESCUE_MAX_SCORE_DIFF_MLB", "3"))
+# La API de ESPN separa por categoria de deporte (football/baseball/...) y
+# dentro de esa categoria por liga (nfl/college-football/mlb/...).
+RESCUE_ESPN_SPORT = {"KXNFLGAME": "football", "KXNCAAFGAME": "football", "KXMLBGAME": "baseball"}
+RESCUE_ESPN_LEAGUE = {"KXNFLGAME": "nfl", "KXNCAAFGAME": "college-football", "KXMLBGAME": "mlb"}
 # El cron sigue corriendo cada 15 min (Render) para vigilar y proteger las
 # posiciones abiertas, pero la BUSQUEDA de entradas nuevas solo se hace una
 # vez cada STRAT_ENTRY_SCAN_MINUTES (60 por defecto = "cada hora, 24/7").
@@ -1253,18 +1259,19 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         print(f"[info] entro en {ticker} a {entry}c x{filled}")
 
 
-def _espn_scoreboard_diffs(league_slug: str, date_yyyymmdd: str) -> dict[frozenset, int] | None:
-    """Diferencia de puntos (valor absoluto) de los partidos EN VIVO de esa
-    liga/fecha segun la API publica de ESPN, indexados por el par de
-    abreviaturas de equipo (frozenset, para no importar el orden). None si
-    la consulta fallo -- el llamador lo trata como 'no se pudo confirmar'."""
-    url = f"https://site.api.espn.com/apis/site/v2/sports/football/{league_slug}/scoreboard"
+def _espn_scoreboard_diffs(sport: str, league_slug: str, date_yyyymmdd: str) -> dict[frozenset, int] | None:
+    """Diferencia de puntos/carreras (valor absoluto) de los partidos EN VIVO
+    de esa categoria de deporte + liga + fecha segun la API publica de ESPN,
+    indexados por el par de abreviaturas de equipo (frozenset, para no
+    importar el orden). None si la consulta fallo -- el llamador lo trata
+    como 'no se pudo confirmar'."""
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league_slug}/scoreboard"
     try:
         resp = requests.get(url, params={"dates": date_yyyymmdd}, timeout=8)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        print(f"[warn] rescate: no se pudo leer el marcador de ESPN ({league_slug} {date_yyyymmdd}): {exc}")
+        print(f"[warn] rescate: no se pudo leer el marcador de ESPN ({sport}/{league_slug} {date_yyyymmdd}): {exc}")
         return None
 
     out: dict[frozenset, int] = {}
@@ -1284,16 +1291,16 @@ def _espn_scoreboard_diffs(league_slug: str, date_yyyymmdd: str) -> dict[frozens
     return out
 
 
-def live_score_diff(league_slug: str, abbr_a: str, abbr_b: str) -> int | None:
-    """Diferencia real de puntos ahora mismo entre abbr_a y abbr_b, segun
-    ESPN. None si no se pudo confirmar (API caida, equipo no encontrado, o
-    el partido no aparece como en vivo en este momento segun ESPN) -- en
-    ese caso el llamador NO debe apostar."""
+def live_score_diff(sport: str, league_slug: str, abbr_a: str, abbr_b: str) -> int | None:
+    """Diferencia real de puntos/carreras ahora mismo entre abbr_a y abbr_b,
+    segun ESPN. None si no se pudo confirmar (API caida, equipo no
+    encontrado, o el partido no aparece como en vivo en este momento segun
+    ESPN) -- en ese caso el llamador NO debe apostar."""
     today = datetime.now(timezone.utc)
     pair = frozenset({abbr_a.upper(), abbr_b.upper()})
     for days_back in (0, 1):
         date_str = (today - timedelta(days=days_back)).strftime("%Y%m%d")
-        diffs = _espn_scoreboard_diffs(league_slug, date_str)
+        diffs = _espn_scoreboard_diffs(sport, league_slug, date_str)
         if diffs is None:
             continue
         if pair in diffs:
@@ -1370,14 +1377,20 @@ def look_for_comeback_bets(conn, cur, public_client: KalshiClient, trading_clien
             # marca "en vivo" ahora mismo), no se apuesta -- mejor perder la
             # oportunidad que apostar a ciegas sobre el marcador.
             series = event.split("-", 1)[0]
+            sport = RESCUE_ESPN_SPORT.get(series)
             league_slug = RESCUE_ESPN_LEAGUE.get(series)
             abbrs = sorted({mm.get("ticker", "").rsplit("-", 1)[-1] for mm in markets if mm.get("ticker")})
-            diff = live_score_diff(league_slug, abbrs[0], abbrs[1]) if (league_slug and len(abbrs) == 2) else None
+            diff = (
+                live_score_diff(sport, league_slug, abbrs[0], abbrs[1])
+                if (sport and league_slug and len(abbrs) == 2)
+                else None
+            )
             if diff is None:
                 print(f"[info] rescate: {event}: no se pudo confirmar el marcador real en ESPN; no se apuesta")
                 continue
-            if diff > RESCUE_MAX_SCORE_DIFF:
-                print(f"[info] rescate: {event}: marcador real a {diff} puntos de diferencia (> {RESCUE_MAX_SCORE_DIFF}); no se apuesta")
+            max_diff = RESCUE_MAX_SCORE_DIFF_MLB if series == "KXMLBGAME" else RESCUE_MAX_SCORE_DIFF
+            if diff > max_diff:
+                print(f"[info] rescate: {event}: marcador real a {diff} de diferencia (> {max_diff}); no se apuesta")
                 continue
 
             count = int((RESCUE_DOLLARS * 100) // yes_ask_cents)
