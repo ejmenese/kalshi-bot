@@ -43,6 +43,12 @@ MAX_ENTRY_CENTS = int(os.environ.get("STRAT_MAX_ENTRY_CENTS", "45"))
 REENTRY_MAX_ENTRY_CENTS = int(os.environ.get("STRAT_REENTRY_MAX_ENTRY_CENTS", "85"))
 TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_TAKE_PROFIT_CENTS", "15"))
 STOP_LOSS_CENTS = int(os.environ.get("STRAT_STOP_LOSS_CENTS", "10"))
+# Venta por ganancia en DOLARES TOTALES de la posicion (no por centavo de
+# contrato ni por %): apenas (bid - entrada) * cantidad de contratos llegue a
+# STRAT_TAKE_PROFIT_DOLLARS dolares, se vende toda la posicion. 0 = apagado.
+# Se suma como gatillo ADICIONAL a los de TP_PCT/TAKE_PROFIT_CENTS -- vende
+# lo que llegue primero.
+TAKE_PROFIT_DOLLARS = float(os.environ.get("STRAT_TAKE_PROFIT_DOLLARS", "0"))
 FIXED_CONTRACTS = int(os.environ.get("STRAT_FIXED_CONTRACTS", "5"))
 # Tamano de entrada reducido que se usa automaticamente mientras la perdida
 # realizada de las ultimas STRAT_LOSS_WINDOW_HOURS siga tocando el limite
@@ -833,6 +839,14 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
             )
         hit_trail = signal == "trail"
         hit_stop_loss = current_bid_cents <= entry_price - STOP_LOSS_CENTS
+        # Gatillo adicional: ganancia en dolares totales de la posicion
+        # (count contratos), independiente del % o los centavos por contrato.
+        hit_dollar_tp = (
+            TAKE_PROFIT_DOLLARS > 0
+            and (current_bid_cents - entry_price) * count >= TAKE_PROFIT_DOLLARS * 100
+        )
+        if hit_dollar_tp:
+            hit_take_profit = True
 
         forced = FORCE_CLOSE_ALL or ticker in FORCE_CLOSE
         if not (hit_take_profit or hit_trail or hit_stop_loss or forced):
