@@ -49,6 +49,15 @@ STOP_LOSS_CENTS = int(os.environ.get("STRAT_STOP_LOSS_CENTS", "10"))
 # Se suma como gatillo ADICIONAL a los de TP_PCT/TAKE_PROFIT_CENTS -- vende
 # lo que llegue primero.
 TAKE_PROFIT_DOLLARS = float(os.environ.get("STRAT_TAKE_PROFIT_DOLLARS", "0"))
+# Si Kalshi ya no muestra la posicion en tu cuenta (se confirmo que no la
+# tienes) pero todavia no publica el resultado oficial del mercado, la
+# posicion se queda "open" en la base de datos reintentando para siempre --
+# y eso ocupa un cupo de MAX_OPEN_POSITIONS aunque ya no exista de verdad.
+# Pasadas STRAT_STALE_HOURS desde que se abrio, se cierra igual (sin inventar
+# un pnl: se deja pnl_cents en NULL y backfill_settled_pnl lo completa solo
+# en cuanto Kalshi publique el resultado), para no bloquear entradas nuevas
+# por una fila fantasma.
+STALE_HOURS = float(os.environ.get("STRAT_STALE_HOURS", "24"))
 FIXED_CONTRACTS = int(os.environ.get("STRAT_FIXED_CONTRACTS", "5"))
 # Tamano de entrada reducido que se usa automaticamente mientras la perdida
 # realizada de las ultimas STRAT_LOSS_WINDOW_HOURS siga tocando el limite
@@ -755,7 +764,7 @@ def backfill_settled_pnl(cur, public_client: KalshiClient, max_rows: int = 20) -
 
 
 def manage_open_positions(cur, public_client: KalshiClient, trading_client: KalshiTradingClient) -> None:
-    cur.execute("SELECT id, ticker, count, entry_price, peak_bid FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
+    cur.execute("SELECT id, ticker, count, entry_price, peak_bid, opened_at FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     open_trades = cur.fetchall()
     if not open_trades:
         return
@@ -785,7 +794,7 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
             held_cache["v"] = kalshi_held_quantities(trading_client)
         return held_cache["v"]
 
-    for trade_id, ticker, count, entry_price, peak_bid in open_trades:
+    for trade_id, ticker, count, entry_price, peak_bid, opened_at in open_trades:
         market = live_by_ticker.get(ticker)
 
         if market is None and ticker.split("-", 1)[0] not in series_ok:
@@ -808,7 +817,20 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
             # oficial; si aun no esta publicado se deja abierto y se reintenta.
             settle = settlement_pnl_cents(public_client, ticker, entry_price, count)
             if settle is None:
-                print(f"[info] {ticker} ya no esta en tu cuenta pero aun no hay resultado; se reintenta")
+                hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+                if hours_open < STALE_HOURS:
+                    print(f"[info] {ticker} ya no esta en tu cuenta pero aun no hay resultado; se reintenta")
+                    continue
+                # Lleva mas de STALE_HOURS confirmada como no-tenida y Kalshi
+                # sigue sin publicar el resultado: se cierra para liberar el
+                # cupo. pnl_cents queda NULL -- backfill_settled_pnl lo rellena
+                # solo apenas el resultado este disponible.
+                cur.execute(
+                    """UPDATE kalshi_trades SET status = 'closed_settled', closed_at = %s
+                           WHERE id = %s""",
+                    (datetime.now(timezone.utc), trade_id),
+                )
+                print(f"[info] {ticker} lleva mas de {STALE_HOURS:.0f}h confirmada fuera de tu cuenta sin resultado publicado; se cierra para liberar el cupo (pnl se completa despues)")
                 continue
             cur.execute(
                 """UPDATE kalshi_trades SET status = 'closed_settled', closed_at = %s,
