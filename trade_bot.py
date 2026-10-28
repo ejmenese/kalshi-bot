@@ -135,6 +135,14 @@ ENTRY_SCAN_INTERVAL_MINUTES = int(os.environ.get("STRAT_ENTRY_SCAN_MINUTES", "60
 # de precio que mas tarde. El cron sigue corriendo cada 15 min, asi que en el
 # peor caso se detecta dentro de esa ventana de 15 min, no al instante exacto.
 NEW_GAME_WINDOW_MINUTES = int(os.environ.get("STRAT_NEW_GAME_WINDOW_MINUTES", "20"))
+# Con STRAT_SCAN_LIVE_GAMES=1 (por defecto) ya no hace falta que el partido
+# "acabe de arrancar": CUALQUIER mercado abierto en una serie permitida
+# adelanta la busqueda igual, sin esperar ENTRY_SCAN_INTERVAL_MINUTES
+# completos. MAX_ENTRIES_PER_HOUR y el cupo de posiciones ya limitan cuanto
+# se compra, asi que esperar la hora completa solo retrasaba aprovechar
+# partidos que ya estaban en curso. En 0/false se vuelve al comportamiento
+# anterior (solo partidos recien arrancados, NEW_GAME_WINDOW_MINUTES).
+SCAN_LIVE_GAMES = os.environ.get("STRAT_SCAN_LIVE_GAMES", "1").strip().lower() in ("1", "true", "yes", "si")
 # Kalshi reparte el saldo en "bolsillos" (exchange_index) y cada mercado solo
 # puede pagarse con el suyo. Con STRAT_POCKET_CHECK=1 (por defecto) el bot solo
 # compra en mercados cuyo bolsillo tiene saldo suficiente.
@@ -617,16 +625,20 @@ def mark_entry_scan_done(cur) -> None:
 
 
 def has_new_game(public_client: KalshiClient, series_tickers: list[str]) -> bool:
-    """True si hay al menos un mercado (en alguna de las series ya permitidas)
-    que abrio para operar hace menos de NEW_GAME_WINDOW_MINUTES -- senal de
-    que un partido acaba de arrancar. Se usa para adelantar la busqueda de
-    entradas sin esperar a que pase la hora completa."""
+    """True si hay un partido que adelanta la busqueda de entradas sin
+    esperar a que pase la hora completa (ENTRY_SCAN_INTERVAL_MINUTES).
+    Con STRAT_SCAN_LIVE_GAMES activo (default), CUALQUIER mercado abierto en
+    una serie permitida cuenta -- partido en curso, no solo recien
+    arrancado. Si no, solo cuenta un mercado que abrio hace menos de
+    NEW_GAME_WINDOW_MINUTES (comportamiento anterior)."""
     now = datetime.now(timezone.utc)
     for i, series in enumerate(series_tickers):
         if i > 0:
             time.sleep(SERIES_PAUSE_SECONDS)
         try:
             for m in public_client.get_open_markets_for_series(series):
+                if SCAN_LIVE_GAMES:
+                    return True
                 open_dt = _parse_kalshi_time(m.get("open_time"))
                 if open_dt is None:
                     continue
@@ -1245,7 +1257,24 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     # libere un cupo, en vez de recien reaccionar cuando ya hace falta comprar.
     pockets = check_and_rebalance_pockets(trading_client)
 
-    if total_open() >= MAX_OPEN_POSITIONS:
+    # Con STRAT_FIXED_DOLLARS activo, el cupo real de posiciones simultaneas
+    # no puede pasar de lo que el saldo alcanza a cubrir -- no tiene sentido
+    # permitir un MAX_OPEN_POSITIONS de 4 si el saldo solo da para 2 ordenes
+    # de $10. effective_max_open() se recalcula cada corrida: sube solo
+    # cuando el saldo de verdad crece, sin que haya que subir el numero a
+    # mano cada vez. STRAT_MAX_OPEN_POSITIONS sigue siendo el techo -- el
+    # maximo al que se quiere llegar mas adelante.
+    def effective_max_open() -> int:
+        if FIXED_DOLLARS <= 0 or pockets is None:
+            return MAX_OPEN_POSITIONS
+        by_balance = max(1, int(sum(pockets.values()) // FIXED_DOLLARS))
+        return min(MAX_OPEN_POSITIONS, by_balance)
+
+    max_open_now = effective_max_open()
+    if max_open_now < MAX_OPEN_POSITIONS:
+        print(f"[info] cupo de posiciones limitado por saldo: {max_open_now} de {MAX_OPEN_POSITIONS} (a ${FIXED_DOLLARS:.2f} por orden)")
+
+    if total_open() >= max_open_now:
         print("[info] maximo de posiciones abiertas alcanzado, no se buscan nuevas entradas")
         return
     if hourly_cap_reached(cur):
@@ -1279,7 +1308,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     skipped_pockets: set[int] = set()
     insufficient_fails = 0
     for market in iter_markets():
-        if total_open() >= MAX_OPEN_POSITIONS:
+        if total_open() >= max_open_now:
             print("[info] maximo de posiciones abiertas alcanzado")
             break
         if hourly_cap_reached(cur):
@@ -1662,7 +1691,8 @@ def main() -> None:
                 # de arrancar se adelanta la busqueda igual -- ahi suele haber
                 # mas oportunidades de precio que esperando a que pase la hora.
                 if has_new_game(public_client, series_tickers):
-                    print(f"[info] partido nuevo detectado (abrio hace <= {NEW_GAME_WINDOW_MINUTES} min); se adelanta la busqueda de entradas sin esperar a que pase la hora")
+                    reason = "hay partidos en curso" if SCAN_LIVE_GAMES else f"abrio hace <= {NEW_GAME_WINDOW_MINUTES} min"
+                    print(f"[info] partido detectado ({reason}); se adelanta la busqueda de entradas sin esperar a que pase la hora")
                     with conn.cursor() as cur:
                         mark_entry_scan_done(cur)
                         look_for_entries(conn, cur, public_client, trading_client, series_tickers)
