@@ -367,6 +367,43 @@ def rebalance_pockets_explicitly(trading_client: KalshiTradingClient, pockets: d
             continue
 
 
+def check_and_rebalance_pockets(trading_client: KalshiTradingClient) -> dict[int, float] | None:
+    """Lee el saldo real por bolsillo (exchange_index) y, si
+    STRAT_AUTO_REBALANCE esta activo, lo reparte parejo entre todos. Antes
+    esto solo corria dentro de look_for_entries(), asi que con
+    STRAT_ENTRIES_PAUSED=1 el saldo se quedaba como estuviera -- un bolsillo
+    podia quedar sin fondos para un deporte aunque el saldo total alcanzara.
+    Se llama aparte, desde main(), para que el reparto se mantenga parejo
+    aunque las entradas nuevas esten en pausa."""
+    if not POCKET_CHECK:
+        return None
+    try:
+        bd = trading_client.get_balance().get("balance_breakdown") or []
+        pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
+        print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
+        if AUTO_REBALANCE:
+            ensure_even_target_allocation(trading_client, pockets)
+            rebalance_pockets_explicitly(trading_client, pockets)
+            try:
+                current_target = trading_client.get_target_balance_allocation()
+                print(f"[info] reparto objetivo que Kalshi tiene guardado ahora: {current_target}")
+            except Exception as texc:
+                print(f"[warn] no se pudo leer el reparto objetivo guardado: {str(texc)[:200]}")
+            try:
+                resting = trading_client.get_resting_orders().get("orders") or []
+                held_by_pocket: dict[int, float] = {}
+                for o in resting:
+                    idx = int(o.get("exchange_index", -1))
+                    held_by_pocket[idx] = held_by_pocket.get(idx, 0.0) + float(o.get("yes_price", o.get("no_price", 0)) or 0) * int(o.get("remaining_count", o.get("count", 0)) or 0) / 100
+                print(f"[info] {len(resting)} ordenes resting; saldo retenido estimado por bolsillo: {held_by_pocket}")
+            except Exception as rexc:
+                print(f"[warn] no se pudo calcular saldo retenido por ordenes resting: {str(rexc)[:200]}")
+        return pockets
+    except Exception as bexc:
+        print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
+        return None
+
+
 def autofund_pocket(trading_client: KalshiTradingClient, pockets: dict[int, float], pocket: int, needed_cents: float) -> bool:
     """Intenta cubrir `needed_cents` en `pocket` transfiriendolo desde el
     bolsillo con mas sobrante. Actualiza `pockets` de forma optimista si la
@@ -1190,31 +1227,7 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     # limite) el rebalanceo nunca se llegaba a pedir. Pidiendolo aqui arriba,
     # Kalshi ya va dejando el saldo repartido mientras el bot espera a que se
     # libere un cupo, en vez de recien reaccionar cuando ya hace falta comprar.
-    pockets: dict[int, float] | None = None
-    if POCKET_CHECK:
-        try:
-            bd = trading_client.get_balance().get("balance_breakdown") or []
-            pockets = {int(b["exchange_index"]): float(b["balance"]) for b in bd}
-            print("[info] saldo por bolsillo: " + ", ".join(f"{k}=${v:.2f}" for k, v in sorted(pockets.items())))
-            if AUTO_REBALANCE:
-                ensure_even_target_allocation(trading_client, pockets)
-                rebalance_pockets_explicitly(trading_client, pockets)
-                try:
-                    current_target = trading_client.get_target_balance_allocation()
-                    print(f"[info] reparto objetivo que Kalshi tiene guardado ahora: {current_target}")
-                except Exception as texc:
-                    print(f"[warn] no se pudo leer el reparto objetivo guardado: {str(texc)[:200]}")
-                try:
-                    resting = trading_client.get_resting_orders().get("orders") or []
-                    held_by_pocket: dict[int, float] = {}
-                    for o in resting:
-                        idx = int(o.get("exchange_index", -1))
-                        held_by_pocket[idx] = held_by_pocket.get(idx, 0.0) + float(o.get("yes_price", o.get("no_price", 0)) or 0) * int(o.get("remaining_count", o.get("count", 0)) or 0) / 100
-                    print(f"[info] {len(resting)} ordenes resting; saldo retenido estimado por bolsillo: {held_by_pocket}")
-                except Exception as rexc:
-                    print(f"[warn] no se pudo calcular saldo retenido por ordenes resting: {str(rexc)[:200]}")
-        except Exception as bexc:
-            print(f"[warn] no se pudo leer el saldo por bolsillo ({str(bexc)[:120]}); se intenta comprar sin filtrar")
+    pockets = check_and_rebalance_pockets(trading_client)
 
     if total_open() >= MAX_OPEN_POSITIONS:
         print("[info] maximo de posiciones abiertas alcanzado, no se buscan nuevas entradas")
@@ -1591,6 +1604,11 @@ def main() -> None:
         with conn.cursor() as cur:
             backfill_settled_pnl(cur, public_client)
             conn.commit()
+
+        # El reparto de bolsillos se mantiene parejo SIEMPRE, incluso en
+        # pausa -- si no, un bolsillo puede quedarse sin fondos para un
+        # deporte mientras el saldo total si alcanza.
+        check_and_rebalance_pockets(trading_client)
 
         if ENTRIES_PAUSED:
             print("[info] STRAT_ENTRIES_PAUSED activo: no se abren posiciones nuevas (las abiertas siguen vigiladas)")
