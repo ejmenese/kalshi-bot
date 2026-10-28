@@ -248,6 +248,13 @@ FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOS
 # ponga en 0 la variable en Render (no se apaga solo).
 CANCEL_ALL_ORDERS = os.environ.get("STRAT_CANCEL_ALL_ORDERS", "").strip().lower() in ("1", "true", "yes", "si")
 BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
+# En demo el bot no opera NADA -- ni posiciones del bot, ni protege/vende
+# posiciones manuales, ni abre entradas nuevas, ni cancela ordenes, ni
+# rebalancea bolsillos. Demo queda como modo "solo observar": el usuario
+# puede probar ordenes manuales ahi sin que el bot las toque. Esto es
+# intencional e independiente de STRAT_PROTECT_MANUAL/STRAT_ENTRIES_PAUSED/
+# etc. -- esas variables siguen controlando el comportamiento en PROD.
+IS_DEMO = BOT_ENV == "demo"
 SERIES_PAUSE_SECONDS = float(os.environ.get("STRAT_SERIES_PAUSE_SECONDS", "0.25"))
 # Candado de Postgres para que nunca corran dos instancias a la vez.
 RUN_LOCK_ID = 774411
@@ -1582,6 +1589,13 @@ def main() -> None:
 
         with conn.cursor() as cur:
             print_pnl_summary(cur)
+
+        if IS_DEMO:
+            print("[info] ambiente demo: el bot no opera nada (no protege, no vende, no abre, no rebalancea) -- solo observa")
+            with conn.cursor() as cur:
+                backfill_settled_pnl(cur, public_client)
+                conn.commit()
+            return
 
         if CANCEL_ALL_ORDERS:
             cancel_all_resting_orders(trading_client)
