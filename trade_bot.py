@@ -277,7 +277,13 @@ FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOS
 # interruptor manual: queda activo en cada corrida hasta que se quite o se
 # ponga en 0 la variable en Render (no se apaga solo).
 CANCEL_ALL_ORDERS = os.environ.get("STRAT_CANCEL_ALL_ORDERS", "").strip().lower() in ("1", "true", "yes", "si")
-BOT_ENV = "prod" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "prod" else "demo"
+# OJO: igual que kalshi_client.base_url(), solo el valor exacto "demo" es
+# demo -- cualquier otra cosa (prod, real, etc.) es dinero real. Antes esto
+# exigia exactamente "prod" y caia en demo con cualquier otro valor (p. ej.
+# KALSHI_ENV=real quedaba en modo demo, inerte, sin avisar). Asi ambos
+# archivos usan el mismo criterio y no hay forma de "caer" en demo por error
+# de dedo en el valor.
+BOT_ENV = "demo" if os.environ.get("KALSHI_ENV", "demo").strip().lower() == "demo" else "prod"
 # En demo el bot no opera NADA -- ni posiciones del bot, ni protege/vende
 # posiciones manuales, ni abre entradas nuevas, ni cancela ordenes, ni
 # rebalancea bolsillos. Demo queda como modo "solo observar": el usuario
