@@ -170,28 +170,41 @@ MANUAL_TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_MANUAL_TAKE_PROFIT_CENTS", 
 # TP_PCT: vender cuando el bid llegue a esta ganancia % sobre el costo (120 = 2.2x).
 #         Con 0 se vuelve al take-profit anterior (centavos fijos / % viejo).
 # TRAIL_KEEP_PCT: si la jugada subio pero NO llego al TP, vender cuando la
-#         ganancia caiga a este % de su maximo (50 = la mitad de la ganancia maxima).
-# TRAIL_MIN_PEAK_PCT: la proteccion de retroceso solo se arma cuando el maximo
-#         ya supero esta ganancia % (evita vender por ruido de 1c, que con el
-#         margen de venta terminaria en perdida). 0 = armar desde el primer centavo.
+#         ganancia caiga a este % de su maximo (80 = se vende al perder solo el
+#         20% de la ganancia maxima -- se prefiere asegurar centavos de ganancia
+#         en vez de arriesgarse a que la ganancia siga bajando).
+# TRAIL_MIN_PEAK_PCT / TRAIL_MIN_PEAK_CENTS: la proteccion de retroceso solo se
+#         arma cuando el maximo ya supero AMBOS: esta ganancia % Y esta cantidad
+#         de centavos. El limite en centavos es el que de verdad protege -- evita
+#         vender por ruido de 1-2c que, con el margen de venta (SL_SLIPPAGE_CENTS),
+#         terminaria en perdida en vez de ganancia.
 TP_PCT = float(os.environ.get("STRAT_TP_PCT", "120"))
-TRAIL_KEEP_PCT = float(os.environ.get("STRAT_TRAIL_KEEP_PCT", "50"))
-TRAIL_MIN_PEAK_PCT = float(os.environ.get("STRAT_TRAIL_MIN_PEAK_PCT", "5"))
+TRAIL_KEEP_PCT = float(os.environ.get("STRAT_TRAIL_KEEP_PCT", "80"))
+TRAIL_MIN_PEAK_PCT = float(os.environ.get("STRAT_TRAIL_MIN_PEAK_PCT", "2"))
+TRAIL_MIN_PEAK_CENTS = float(os.environ.get("STRAT_TRAIL_MIN_PEAK_CENTS", "5"))
 
 
 def profit_exit_signal(entry_c: float, peak_c: float, bid_c: float) -> str | None:
-    """'tp' si el bid llego a +TP_PCT% sobre el costo; 'trail' si el maximo ya
-    supero TRAIL_MIN_PEAK_PCT% y el bid cayo a la fraccion TRAIL_KEEP_PCT% de
-    esa ganancia maxima; None en cualquier otro caso."""
+    """'tp' si el bid llego a +TP_PCT% sobre el costo; 'trail' si la ganancia
+    maxima ya supero TRAIL_MIN_PEAK_PCT% Y TRAIL_MIN_PEAK_CENTS centavos (asi
+    la venta deja ganancia real incluso despues del margen de venta) y el bid
+    cayo a la fraccion TRAIL_KEEP_PCT% de esa ganancia maxima; None en
+    cualquier otro caso."""
     if entry_c <= 0:
         return None
     if TP_PCT > 0 and bid_c >= min(99.0, entry_c * (1 + TP_PCT / 100.0)):
         return "tp"
     peak_c = max(peak_c, bid_c)
-    peak_gain_pct = (peak_c - entry_c) / entry_c * 100.0
-    if TRAIL_KEEP_PCT > 0 and peak_gain_pct > 0 and peak_gain_pct >= TRAIL_MIN_PEAK_PCT:
-        if bid_c <= entry_c + (peak_c - entry_c) * TRAIL_KEEP_PCT / 100.0:
-            return "trail"
+    peak_gain_c = peak_c - entry_c
+    peak_gain_pct = peak_gain_c / entry_c * 100.0
+    armed = (
+        TRAIL_KEEP_PCT > 0
+        and peak_gain_c > 0
+        and peak_gain_pct >= TRAIL_MIN_PEAK_PCT
+        and peak_gain_c >= TRAIL_MIN_PEAK_CENTS
+    )
+    if armed and bid_c <= entry_c + peak_gain_c * TRAIL_KEEP_PCT / 100.0:
+        return "trail"
     return None
 
 
