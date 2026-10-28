@@ -299,10 +299,27 @@ EXCLUDED_MARKET_SUFFIXES = ("-TIE", "-DRAW")
 _ew = os.environ.get("STRAT_EXCLUDE_WORDS", "")
 USER_EXCLUDED_WORDS = tuple(w.strip().upper() for w in _ew.split(",") if w.strip())
 
+# Series que el usuario pidio agregar por su ticker exacto en KALSHI_SERIES
+# (p. ej. "ALL_SPORTS,KXNPBGAME,KXKBOGAME,KXVENFUTVEGAME"). Estas NUNCA se
+# filtran por STRAT_EXCLUDE_WORDS -- ese filtro es para el descubrimiento
+# automatico (ALL_SPORTS), no para algo que se pidio explicitamente por
+# nombre. Si no, agregar una serie puntual no sirve de nada cuando su ticker
+# coincide con una palabra excluida de otro deporte (p. ej. "FUT" bloqueando
+# KXVENFUTVEGAME aunque se haya agregado a mano).
+_raw_kalshi_series = os.environ.get("KALSHI_SERIES", "ALL_SPORTS")
+EXPLICIT_SERIES = {
+    s.strip().upper() for s in _raw_kalshi_series.split(",")
+    if s.strip() and s.strip().upper() != "ALL_SPORTS"
+}
+
 
 def series_allowed(series: str) -> bool:
     s = series.upper()
-    return not any(w in s for w in EXCLUDED_SERIES_WORDS) and not any(w in s for w in USER_EXCLUDED_WORDS)
+    if any(w in s for w in EXCLUDED_SERIES_WORDS):
+        return False
+    if s in EXPLICIT_SERIES:
+        return True
+    return not any(w in s for w in USER_EXCLUDED_WORDS)
 
 
 def market_allowed(ticker: str) -> bool:
