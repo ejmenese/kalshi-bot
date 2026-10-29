@@ -43,6 +43,14 @@ MAX_ENTRY_CENTS = int(os.environ.get("STRAT_MAX_ENTRY_CENTS", "45"))
 REENTRY_MAX_ENTRY_CENTS = int(os.environ.get("STRAT_REENTRY_MAX_ENTRY_CENTS", "85"))
 TAKE_PROFIT_CENTS = int(os.environ.get("STRAT_TAKE_PROFIT_CENTS", "15"))
 STOP_LOSS_CENTS = int(os.environ.get("STRAT_STOP_LOSS_CENTS", "10"))
+# Si STRAT_STOP_LOSS_PCT > 0, el stop-loss de las posiciones del bot se calcula
+# como % de caida sobre lo pagado (p. ej. 25 = vender si el precio cae al 75%
+# de lo que costo) en vez de STOP_LOSS_CENTS (centavos fijos). Pedido por el
+# usuario para que la proteccion escale con el precio de entrada ahora que las
+# entradas van del lado favorito (55-85c) y no de un rango angosto barato
+# (20-45c), donde un stop fijo de centavos representa un % muy distinto segun
+# el precio pagado. 0 = apagado, se sigue usando STOP_LOSS_CENTS como antes.
+STOP_LOSS_PCT = float(os.environ.get("STRAT_STOP_LOSS_PCT", "0"))
 # Venta por ganancia en DOLARES TOTALES de la posicion (no por centavo de
 # contrato ni por %): apenas (bid - entrada) * cantidad de contratos llegue a
 # STRAT_TAKE_PROFIT_DOLLARS dolares, se vende toda la posicion. 0 = apagado.
@@ -987,7 +995,10 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
                 entry_price + TAKE_PROFIT_CENTS, entry_price * (1 + PCT_TARGET_PERCENT / 100)
             )
         hit_trail = signal == "trail"
-        hit_stop_loss = current_bid_cents <= entry_price - STOP_LOSS_CENTS
+        if STOP_LOSS_PCT > 0:
+            hit_stop_loss = current_bid_cents <= entry_price * (1 - STOP_LOSS_PCT / 100.0)
+        else:
+            hit_stop_loss = current_bid_cents <= entry_price - STOP_LOSS_CENTS
         # Gatillo adicional: ganancia en dolares totales de la posicion
         # (count contratos), independiente del % o los centavos por contrato.
         hit_dollar_tp = (
