@@ -267,10 +267,36 @@ SL_SLIPPAGE_CENTS = int(os.environ.get("STRAT_SL_SLIPPAGE_CENTS", "3"))
 # Ambiente en el que opera esta corrida; cada trade se etiqueta con el y todas
 # las consultas filtran por el, para no mezclar demo con dinero real.
 # Cierre manual: STRAT_FORCE_CLOSE=ALL o una lista de tickers separados por coma.
-# Vende esas posiciones al mejor bid (con el mismo margen del stop-loss).
+# Vende esas posiciones al mejor bid (con el mismo margen del stop-loss). OJO:
+# esto solo aplica a posiciones que el BOT abrio (las que estan en
+# kalshi_trades) -- para posiciones que el usuario puso a mano en la app, ver
+# STRAT_FORCE_CLOSE_MANUAL abajo.
 _fc = os.environ.get("STRAT_FORCE_CLOSE", "").strip()
 FORCE_CLOSE_ALL = _fc.upper() == "ALL"
 FORCE_CLOSE = {t.strip() for t in _fc.split(",") if t.strip()} if not FORCE_CLOSE_ALL else set()
+
+# Cierre manual de posiciones PUESTAS A MANO en la app (protect_manual_positions
+# no tiene ticker exacto de antemano como el bot, asi que esto funciona por
+# pistas/substrings en vez de ticker exacto): STRAT_FORCE_CLOSE_MANUAL=ALL, o
+# una lista de pistas separadas por coma que TODAS deben aparecer en el ticker
+# (p.ej. "26OCT29,DAR" cierra el contrato de esa fecha que tenga "DAR" en el
+# ticker). Usa ';' para separar varias combinaciones distintas si se quiere
+# cerrar mas de una posicion puntual a la vez.
+_fcm = os.environ.get("STRAT_FORCE_CLOSE_MANUAL", "").strip()
+FORCE_CLOSE_MANUAL_ALL = _fcm.upper() == "ALL"
+FORCE_CLOSE_MANUAL_GROUPS: list[list[str]] = []
+if _fcm and not FORCE_CLOSE_MANUAL_ALL:
+    for _group in _fcm.split(";"):
+        _tokens = [t.strip().upper() for t in _group.split(",") if t.strip()]
+        if _tokens:
+            FORCE_CLOSE_MANUAL_GROUPS.append(_tokens)
+
+
+def manual_force_close_matches(ticker: str) -> bool:
+    if FORCE_CLOSE_MANUAL_ALL:
+        return True
+    tk = ticker.upper()
+    return any(all(tok in tk for tok in group) for group in FORCE_CLOSE_MANUAL_GROUPS)
 # Con STRAT_CANCEL_ALL_ORDERS=1, al inicio de la corrida se cancelan TODAS las
 # ordenes que sigan "resting" (sin llenar) en el libro de Kalshi -- tanto las
 # que puso el bot como las que el usuario puso a mano en la app. Es un
@@ -1101,7 +1127,9 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
         peak_c = max(get_peak(cur, peak_key) or 0.0, avg_cost, bid_c)
         set_peak(cur, peak_key, peak_c)
         signal = profit_exit_signal(avg_cost, peak_c, bid_c)
-        if bid_c <= avg_cost - MANUAL_STOP_CENTS:
+        if manual_force_close_matches(ticker):
+            reason = "cierre_forzado"
+        elif bid_c <= avg_cost - MANUAL_STOP_CENTS:
             reason = "perdida"
         elif TP_PCT > 0 and signal == "tp":
             reason = "ganancia"
@@ -1130,7 +1158,9 @@ def protect_manual_positions(cur, public_client: KalshiClient, trading_client: K
         pnl_aprox = round((exit_c - avg_cost) * filled)
         if filled >= count:
             clear_peak(cur, peak_key)
-        if reason == "perdida":
+        if reason == "cierre_forzado":
+            print(f"[info] posicion manual {ticker} cerrada por STRAT_FORCE_CLOSE_MANUAL: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
+        elif reason == "perdida":
             print(f"[info] posicion manual {ticker} cerrada por proteccion: {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
         elif reason == "ganancia_retroceso":
             print(f"[info] posicion manual {ticker} cerrada por ganancia (retroceso desde el maximo {peak_c:.0f}c): {filled} a {exit_c}c (costo medio {avg_cost:.0f}c, pnl aprox {pnl_aprox}c)")
