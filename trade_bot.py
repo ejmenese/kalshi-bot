@@ -902,7 +902,9 @@ def manage_open_positions(cur, public_client: KalshiClient, trading_client: Kals
     cur.execute("SELECT id, ticker, count, entry_price, peak_bid, opened_at FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     open_trades = cur.fetchall()
     if not open_trades:
+        print("[info] 0 posiciones del bot abiertas en este momento")
         return
+    print(f"[info] {len(open_trades)} posiciones del bot abiertas en este momento: {', '.join(t[1] for t in open_trades)}")
 
     # Trae el estado actual de todos los mercados relevantes de una vez.
     # La serie es lo que va antes del primer guion (KXACBGAME-26OCT...-ZAR
