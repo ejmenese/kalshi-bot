@@ -95,6 +95,25 @@ LOSS_WINDOW_HOURS = int(os.environ.get("STRAT_LOSS_WINDOW_HOURS", "24"))
 MAX_ENTRIES_PER_GAME = int(os.environ.get("STRAT_MAX_ENTRIES_PER_GAME", "3"))
 # Maximo de entradas nuevas por hora (ventana movil de 60 min). 0 = sin limite.
 MAX_ENTRIES_PER_HOUR = int(os.environ.get("STRAT_MAX_ENTRIES_PER_HOUR", "0"))
+# Minutos minimos que tienen que pasar entre una entrada nueva y la
+# siguiente (de cualquier partido). 0 = sin limite. A diferencia de
+# MAX_ENTRIES_PER_HOUR (un conteo en ventana movil de 1h, que puede dejar
+# pasar varias entradas juntas si no hubo ninguna antes), esto espacia las
+# entradas de forma pareja -- "una cada X minutos" en vez de "hasta N por
+# hora". El usuario pidio este espaciado (p. ej. una cada 2h =
+# STRAT_ENTRY_MIN_INTERVAL_MINUTES=120) para no juntar varias entradas de
+# golpe como pasaba antes.
+ENTRY_MIN_INTERVAL_MINUTES = float(os.environ.get("STRAT_ENTRY_MIN_INTERVAL_MINUTES", "0"))
+# Maximo de entradas nuevas en el dia de calendario UTC actual. 0 = sin limite.
+MAX_ENTRIES_PER_DAY = int(os.environ.get("STRAT_MAX_ENTRIES_PER_DAY", "0"))
+# Con STRAT_SAME_DAY_ONLY=1, solo se consideran mercados cuyo close_time cae
+# en el mismo dia de calendario UTC que "ahora" -- es decir, partidos que
+# juegan HOY. Antes el bot entraba en cualquier mercado abierto de la serie
+# sin mirar la fecha del partido, lo que dejaba posiciones montadas en
+# partidos de dentro de varios dias (p. ej. compradas el 31-oct para un
+# partido del 6-nov) con el capital inmovilizado todo ese tiempo sin
+# resolver. 0/false = sin filtro de fecha (comportamiento anterior).
+SAME_DAY_ONLY = os.environ.get("STRAT_SAME_DAY_ONLY", "0").strip().lower() in ("1", "true", "yes", "si")
 
 # --- Apuesta de rescate (comeback) en futbol americano -----------------
 # Regla aparte del filtro normal de entradas (que va de MIN_ENTRY_CENTS a
@@ -852,6 +871,51 @@ def hourly_cap_reached(cur) -> bool:
     return MAX_ENTRIES_PER_HOUR > 0 and entries_last_hour(cur) >= MAX_ENTRIES_PER_HOUR
 
 
+def minutes_since_last_entry(cur) -> float | None:
+    """Minutos desde la ultima entrada registrada (cualquier partido), para
+    este entorno. None si todavia no hay ninguna entrada registrada."""
+    cur.execute(
+        "SELECT EXTRACT(EPOCH FROM (now() - MAX(opened_at))) / 60.0 FROM kalshi_trades WHERE env = %s",
+        (BOT_ENV,),
+    )
+    row = cur.fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def entry_interval_reached(cur) -> bool:
+    """True si todavia no pasaron ENTRY_MIN_INTERVAL_MINUTES desde la ultima
+    entrada -- en ese caso no se busca ninguna entrada nueva en esta
+    corrida, sin importar cuantas entradas hayan pasado en la ultima hora."""
+    if ENTRY_MIN_INTERVAL_MINUTES <= 0:
+        return False
+    since = minutes_since_last_entry(cur)
+    return since is not None and since < ENTRY_MIN_INTERVAL_MINUTES
+
+
+def entries_today(cur) -> int:
+    """Entradas registradas en el dia de calendario UTC actual."""
+    cur.execute(
+        "SELECT COUNT(*) FROM kalshi_trades WHERE env = %s AND opened_at >= date_trunc('day', now() AT TIME ZONE 'UTC')",
+        (BOT_ENV,),
+    )
+    return cur.fetchone()[0]
+
+
+def daily_cap_reached(cur) -> bool:
+    return MAX_ENTRIES_PER_DAY > 0 and entries_today(cur) >= MAX_ENTRIES_PER_DAY
+
+
+def market_is_same_day(market: dict, now: datetime) -> bool:
+    """True si el close_time del mercado cae en el mismo dia de calendario
+    UTC que 'now' -- es decir, el partido se juega (y el mercado cierra) HOY.
+    Si no se pudo leer/parsear close_time, se descarta el mercado (mejor
+    quedarse sin esa entrada que montarse en un partido de fecha incierta)."""
+    close_dt = _parse_kalshi_time(market.get("close_time"))
+    if close_dt is None:
+        return False
+    return close_dt.astimezone(timezone.utc).date() == now.date()
+
+
 def open_positions_count(cur) -> int:
     cur.execute("SELECT COUNT(*) FROM kalshi_trades WHERE status = 'open' AND env = %s", (BOT_ENV,))
     return cur.fetchone()[0]
@@ -1359,6 +1423,13 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
     if hourly_cap_reached(cur):
         print(f"[info] ya hubo {MAX_ENTRIES_PER_HOUR} entrada(s) en la ultima hora; no se abren mas hasta que pase")
         return
+    if daily_cap_reached(cur):
+        print(f"[info] ya hubo {MAX_ENTRIES_PER_DAY} entrada(s) hoy (UTC); no se abren mas hasta el dia siguiente")
+        return
+    if entry_interval_reached(cur):
+        since = minutes_since_last_entry(cur)
+        print(f"[info] solo pasaron {since:.0f} min desde la ultima entrada; se espera a los {ENTRY_MIN_INTERVAL_MINUTES:.0f} min antes de buscar otra")
+        return
     # Antes esto cortaba TODAS las entradas nuevas hasta que la ventana de
     # perdida se enfriara. Ahora, en vez de parar, se sigue comprando pero
     # con tamano reducido (REDUCED_CONTRACTS) -- asi se consume mas lento el
@@ -1393,9 +1464,16 @@ def look_for_entries(conn, cur, public_client: KalshiClient, trading_client: Kal
         if hourly_cap_reached(cur):
             print(f"[info] limite de {MAX_ENTRIES_PER_HOUR} entrada(s) por hora alcanzado")
             break
+        if daily_cap_reached(cur):
+            print(f"[info] limite de {MAX_ENTRIES_PER_DAY} entrada(s) por dia alcanzado")
+            break
+        if entry_interval_reached(cur):
+            break  # ya se imprimio el detalle arriba, al entrar a la funcion
 
         ticker = market.get("ticker")
         if not ticker or not market_allowed(ticker):
+            continue
+        if SAME_DAY_ONLY and not market_is_same_day(market, datetime.now(timezone.utc)):
             continue
         if ticker in busy or already_holds(cur, ticker):
             continue
