@@ -354,6 +354,14 @@ RUN_LOCK_ID = 774411
 EXCLUDED_SERIES_WORDS = ("EXACT", "SCORE", "SPREAD", "TOTAL", "PROP", "PICKLEBALL")
 EXCLUDED_MARKET_SUFFIXES = ("-TIE", "-DRAW")
 
+# Series de "ganador de un set especifico" de tenis (no partido completo).
+# El ticker de mercado es <serie>-<codigo del partido>-<numero de set>, p. ej.
+# KXATPSETWINNER-26OCT09ZHOMUS-1 = set 1, ...-2 = set 2. Solo se opera el
+# set 1 (estrategia "set 1 winner"); se descartan el resto de los sets de
+# la misma serie para no duplicar exposicion al mismo partido.
+SET_WINNER_SERIES_PREFIXES = ("KXATPSETWINNER-", "KXWTASETWINNER-")
+SET1_MARKET_SUFFIX = "-1"
+
 
 _ew = os.environ.get("STRAT_EXCLUDE_WORDS", "")
 USER_EXCLUDED_WORDS = tuple(w.strip().upper() for w in _ew.split(",") if w.strip())
@@ -382,7 +390,12 @@ def series_allowed(series: str) -> bool:
 
 
 def market_allowed(ticker: str) -> bool:
-    return not ticker.upper().endswith(EXCLUDED_MARKET_SUFFIXES)
+    t = ticker.upper()
+    if t.endswith(EXCLUDED_MARKET_SUFFIXES):
+        return False
+    if t.startswith(SET_WINNER_SERIES_PREFIXES) and not t.endswith(SET1_MARKET_SUFFIX):
+        return False
+    return True
 
 
 def cancel_all_resting_orders(trading_client: KalshiTradingClient) -> None:
